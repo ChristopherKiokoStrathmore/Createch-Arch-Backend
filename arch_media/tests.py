@@ -7,6 +7,7 @@ from PIL import Image
 from rest_framework.test import APIClient
 
 MEDIA = tempfile.mkdtemp()
+SECRET = "t" * 40
 
 
 def tiny_png():
@@ -15,11 +16,11 @@ def tiny_png():
     return SimpleUploadedFile("t.png", buf.getvalue(), content_type="image/png")
 
 
-@override_settings(ARCH_ADMIN_SECRET="test-secret", MEDIA_ROOT=MEDIA)
+@override_settings(ARCH_ADMIN_SECRET=SECRET, MEDIA_ROOT=MEDIA)
 class ApiTests(TestCase):
     def setUp(self):
         self.c = APIClient()
-        self.auth = {"HTTP_X_ADMIN_KEY": "test-secret"}
+        self.auth = {"HTTP_X_ADMIN_KEY": SECRET}
 
     def test_upload_rejected_without_key(self):
         r = self.c.post("/api/admin/media/", {"file": tiny_png()}, format="multipart")
@@ -75,3 +76,35 @@ class ApiTests(TestCase):
             )
         ongoing = self.c.get("/api/projects/?status=ongoing").json()
         self.assertEqual([p["slug"] for p in ongoing], ["a"])
+
+    def test_pin_starts_unset(self):
+        r = self.c.get("/api/admin/pin/", **self.auth)
+        self.assertEqual(r.json(), {"set": False, "version": 0})
+        v = self.c.post("/api/admin/pin/", {"pin": "anything"}, format="json", **self.auth)
+        self.assertFalse(v.json()["ok"])
+
+    def test_pin_set_verify_and_change(self):
+        r = self.c.put("/api/admin/pin/", {"pin": "first-pin"}, format="json", **self.auth)
+        self.assertEqual(r.json(), {"set": True, "version": 1})
+        ok = self.c.post("/api/admin/pin/", {"pin": "first-pin"}, format="json", **self.auth)
+        self.assertTrue(ok.json()["ok"])
+        self.c.put("/api/admin/pin/", {"pin": "second-pin"}, format="json", **self.auth)
+        old = self.c.post("/api/admin/pin/", {"pin": "first-pin"}, format="json", **self.auth)
+        self.assertEqual((old.json()["ok"], old.json()["version"]), (False, 2))
+
+    def test_pin_length_enforced(self):
+        r = self.c.put("/api/admin/pin/", {"pin": "123"}, format="json", **self.auth)
+        self.assertEqual(r.status_code, 400)
+
+    def test_pin_requires_key(self):
+        self.assertEqual(self.c.get("/api/admin/pin/").status_code, 403)
+        r = self.c.put("/api/admin/pin/", {"pin": "attacker"}, format="json")
+        self.assertEqual(r.status_code, 403)
+
+
+@override_settings(ARCH_ADMIN_SECRET="generate-a-long-random-string")
+class PlaceholderSecretTests(TestCase):
+    def test_placeholder_secret_opens_nothing(self):
+        c = APIClient()
+        r = c.get("/api/admin/chrome/", HTTP_X_ADMIN_KEY="generate-a-long-random-string")
+        self.assertEqual(r.status_code, 403)

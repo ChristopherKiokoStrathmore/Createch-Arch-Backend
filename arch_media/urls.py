@@ -3,6 +3,7 @@ from rest_framework.routers import DefaultRouter
 
 from .views import (
     AdminChromeView,
+    AdminPinView,
     MediaAssetViewSet,
     ProjectViewSet,
     PublicChromeView,
@@ -20,5 +21,6 @@ urlpatterns = [
     path("chrome/", PublicChromeView.as_view(), name="public-chrome"),
     path("", include(public_router.urls)),
     path("admin/chrome/", AdminChromeView.as_view(), name="admin-chrome"),
+    path("admin/pin/", AdminPinView.as_view(), name="admin-pin"),
     path("admin/", include(admin_router.urls)),
 ]

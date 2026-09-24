@@ -1,10 +1,11 @@
+from django.contrib.auth.hashers import check_password, make_password
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import MediaAsset, Project, ProjectImage, SiteChrome
+from .models import AdminPin, MediaAsset, Project, ProjectImage, SiteChrome
 from .permissions import HasAdminKey
 from .serializers import (
     MediaAssetSerializer,
@@ -15,6 +16,8 @@ from .serializers import (
 )
 
 CHROME_KEY = "default"
+PIN_KEY = "default"
+PIN_MIN, PIN_MAX = 6, 64
 
 
 # ---------------------------------------------------------------- public reads
@@ -94,3 +97,40 @@ class AdminChromeView(APIView):
         chrome.data = request.data.get("data", request.data)
         chrome.save()
         return Response(SiteChromeSerializer(chrome).data)
+
+
+class AdminPinView(APIView):
+    """The /admin PIN. Only the Next server calls this, with X-Admin-Key.
+
+    GET  -> {set, version}
+    POST {pin} -> {ok, set, version}      verify
+    PUT  {pin} -> {set, version}          replace
+    """
+
+    permission_classes = [HasAdminKey]
+
+    @staticmethod
+    def state(row):
+        return {"set": row is not None, "version": row.version if row else 0}
+
+    def get(self, request):
+        return Response(self.state(AdminPin.objects.filter(key=PIN_KEY).first()))
+
+    def post(self, request):
+        row = AdminPin.objects.filter(key=PIN_KEY).first()
+        pin = request.data.get("pin")
+        ok = bool(row) and isinstance(pin, str) and check_password(pin, row.pin_hash)
+        return Response({"ok": ok, **self.state(row)})
+
+    def put(self, request):
+        pin = request.data.get("pin")
+        if not isinstance(pin, str) or not (PIN_MIN <= len(pin) <= PIN_MAX):
+            return Response(
+                {"error": f"PIN must be {PIN_MIN}-{PIN_MAX} characters"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        row, _ = AdminPin.objects.get_or_create(key=PIN_KEY, defaults={"pin_hash": ""})
+        row.pin_hash = make_password(pin)
+        row.version += 1
+        row.save()
+        return Response(self.state(row))

@@ -24,13 +24,18 @@ Admin (send header `X-Admin-Key: <ARCH_ADMIN_SECRET>`):
 - `POST             /api/admin/projects/reorder/`       [{slug, order}, ...]
 - `POST             /api/admin/projects/<slug>/gallery/` attach asset
 - `GET/PUT          /api/admin/chrome/`                 read / replace chrome JSON
+- `GET/POST/PUT     /api/admin/pin/`                    /admin PIN: state / verify / replace (stored hashed)
 
 ## Deploy to Railway (once)
 
 1. Put this folder in a Git repo (see "Push to git" below).
 2. Railway -> New Project -> Deploy from GitHub repo -> pick it.
-3. Add plugin: Postgres. Railway injects `DATABASE_URL` automatically.
-4. Add a Volume, mount path `/data` (durable image storage).
+3. Add a Postgres database. It is NOT wired in automatically: on the web
+   service add the variable `DATABASE_URL=${{Postgres.DATABASE_URL}}`.
+   Without it Django falls back to SQLite inside the container, which is
+   wiped on every deploy.
+4. Add a Volume on the web service, mount path `/data` (durable image
+   storage — without it every upload is wiped on redeploy).
 5. Variables tab -> add the env vars in the next section.
 6. Deploy. The start command runs migrate + collectstatic + gunicorn.
 7. Create an admin login for `/admin/`: open the service Shell and run
