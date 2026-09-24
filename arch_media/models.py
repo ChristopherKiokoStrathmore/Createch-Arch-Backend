@@ -65,3 +65,17 @@ class SiteChrome(models.Model):
 
     def __str__(self):
         return f"SiteChrome<{self.key}>"
+
+
+class AdminPin(models.Model):
+    """The editor's /admin PIN, hashed. One row; replaces ADMIN_PIN on Vercel once set."""
+
+    key = models.CharField(max_length=50, unique=True, default="default")
+    pin_hash = models.CharField(max_length=256)
+    # Bumped on every change; the site signs it into the session cookie, so
+    # changing the PIN signs out every other open admin session.
+    version = models.PositiveIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"AdminPin<{self.key}> v{self.version}"
