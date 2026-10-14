@@ -67,6 +67,28 @@ class SiteChrome(models.Model):
         return f"SiteChrome<{self.key}>"
 
 
+class Enquiry(models.Model):
+    """A public contact-form submission. Bytes of the message live in Postgres."""
+
+    name = models.CharField(max_length=120)
+    email = models.EmailField(max_length=200)
+    phone = models.CharField(max_length=40, blank=True)
+    project_type = models.CharField(max_length=120, blank=True)
+    site = models.CharField(max_length=200, blank=True)
+    stage = models.CharField(max_length=120, blank=True)
+    timeline = models.CharField(max_length=200, blank=True)
+    message = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    read = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        verbose_name_plural = "enquiries"
+
+    def __str__(self):
+        return f"{self.name} <{self.email}>"
+
+
 class AdminPin(models.Model):
     """The editor's /admin PIN, hashed. One row; replaces ADMIN_PIN on Vercel once set."""
 

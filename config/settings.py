@@ -1,8 +1,10 @@
 import os
+import sys
 from pathlib import Path
 
 import dj_database_url
 from corsheaders.defaults import default_headers
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -64,13 +66,58 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "config.wsgi.application"
 
+def resolve_database_url(environ=None, argv=None):
+    """Railway Postgres via DATABASE_URL. SQLite only for tests or ALLOW_SQLITE."""
+    environ = os.environ if environ is None else environ
+    argv = sys.argv if argv is None else argv
+    url = (environ.get("DATABASE_URL") or "").strip()
+    on_railway = bool(environ.get("RAILWAY_ENVIRONMENT") or environ.get("RAILWAY_PROJECT_ID"))
+    running_tests = "test" in argv
+    allow_sqlite = (
+        (environ.get("ALLOW_SQLITE") or "").strip().lower() in ("1", "true", "yes", "on")
+        or running_tests
+    )
+    if not url:
+        if allow_sqlite and not on_railway:
+            return f"sqlite:///{BASE_DIR / 'db.sqlite3'}"
+        raise ImproperlyConfigured(
+            "DATABASE_URL is required and must be Railway Postgres "
+            "(DATABASE_URL=${{Postgres.DATABASE_URL}}). "
+            "SQLite is only for `python manage.py test` or ALLOW_SQLITE=True off Railway."
+        )
+    if url.startswith("sqlite") and (on_railway or not allow_sqlite):
+        raise ImproperlyConfigured(
+            "SQLite is not the production database. Set DATABASE_URL to Railway Postgres."
+        )
+    if not (url.startswith("postgres://") or url.startswith("postgresql://") or url.startswith("sqlite")):
+        raise ImproperlyConfigured(
+            "DATABASE_URL must be a postgres:// or postgresql:// URL (Railway Postgres)."
+        )
+    return url
+
+
 DATABASES = {
-    "default": dj_database_url.config(
-        default=os.environ.get("DATABASE_URL", f"sqlite:///{BASE_DIR / 'db.sqlite3'}"),
+    "default": dj_database_url.parse(
+        resolve_database_url(),
         conn_max_age=600,
         ssl_require=env_bool("DB_SSL_REQUIRE", "False"),
     )
 }
+
+if "postgresql" in DATABASES["default"]["ENGINE"]:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.db.DatabaseCache",
+            "LOCATION": "createch_cache",
+        }
+    }
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "createch-enquiries",
+        }
+    }
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
@@ -115,7 +162,7 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 ARCH_ADMIN_SECRET = os.environ.get("ARCH_ADMIN_SECRET", "")
 
 CORS_ALLOWED_ORIGINS = env_list("CORS_ALLOWED_ORIGINS")
-CORS_ALLOW_HEADERS = list(default_headers) + ["x-admin-key"]
+CORS_ALLOW_HEADERS = list(default_headers) + ["x-admin-key", "x-createch-client-ip"]
 CORS_ALLOW_CREDENTIALS = False
 
 REST_FRAMEWORK = {

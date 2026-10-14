@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import AdminPin, MediaAsset, Project, ProjectImage, SiteChrome
+from .models import AdminPin, Enquiry, MediaAsset, Project, ProjectImage, SiteChrome
 
 
 class ProjectImageInline(admin.TabularInline):
@@ -25,6 +25,14 @@ class MediaAssetAdmin(admin.ModelAdmin):
 @admin.register(SiteChrome)
 class SiteChromeAdmin(admin.ModelAdmin):
     list_display = ("key", "updated_at")
+
+
+@admin.register(Enquiry)
+class EnquiryAdmin(admin.ModelAdmin):
+    list_display = ("created_at", "name", "email", "project_type", "site", "read")
+    list_filter = ("read", "project_type", "stage")
+    search_fields = ("name", "email", "site", "message")
+    readonly_fields = ("created_at",)
 
 
 @admin.register(AdminPin)

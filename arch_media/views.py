@@ -1,13 +1,22 @@
+import hmac
+from datetime import timedelta
+
+from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
+from django.core.cache import cache
+from django.core.exceptions import ValidationError
+from django.core.validators import validate_email
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import AdminPin, MediaAsset, Project, ProjectImage, SiteChrome
-from .permissions import HasAdminKey
+from .models import AdminPin, Enquiry, MediaAsset, Project, ProjectImage, SiteChrome
+from .permissions import MIN_SECRET_LENGTH, HasAdminKey
 from .serializers import (
+    EnquirySerializer,
     MediaAssetSerializer,
     MediaUploadSerializer,
     ProjectImageSerializer,
@@ -134,3 +143,140 @@ class AdminPinView(APIView):
         row.version += 1
         row.save()
         return Response(self.state(row))
+
+
+# ---------------------------------------------------------------- enquiries
+
+IP_LIMIT = 10
+EMAIL_LIMIT = 5
+WINDOW_SECONDS = 60 * 60
+FIELD_LIMITS = {
+    "name": 120,
+    "email": 200,
+    "phone": 40,
+    "project_type": 120,
+    "site": 200,
+    "stage": 120,
+    "timeline": 200,
+    "message": 5000,
+}
+
+
+def _text(value, limit):
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return None
+    cleaned = "".join(
+        ch for ch in value if ch == "\n" or ch == "\r" or ch == "\t" or ord(ch) >= 32
+    ).strip()
+    return cleaned[:limit]
+
+
+def _admin_key_ok(request):
+    secret = getattr(settings, "ARCH_ADMIN_SECRET", "") or ""
+    provided = request.headers.get("X-Admin-Key", "") or ""
+    if len(secret) < MIN_SECRET_LENGTH or len(provided) != len(secret):
+        return False
+    return hmac.compare_digest(provided, secret)
+
+
+def client_ip(request):
+    """Unauthenticated callers are bucketed by REMOTE_ADDR.
+
+    The Next server is one IP for every visitor, so when it presents a valid
+    X-Admin-Key it may pass the visitor address as X-Createch-Client-Ip.
+    """
+    if _admin_key_ok(request):
+        forwarded = (request.headers.get("X-Createch-Client-Ip") or "").split(",")[0].strip()
+        if forwarded:
+            return forwarded[:80]
+    return (request.META.get("REMOTE_ADDR") or "unknown")[:80]
+
+
+def enquiry_rate_limited(request, email):
+    ip_key = f"enquiry:ip:{client_ip(request)}"
+    hits = cache.get(ip_key, 0)
+    if hits >= IP_LIMIT:
+        return True
+    since = timezone.now() - timedelta(seconds=WINDOW_SECONDS)
+    if (
+        Enquiry.objects.filter(email__iexact=email, created_at__gte=since).count()
+        >= EMAIL_LIMIT
+    ):
+        return True
+    cache.set(ip_key, hits + 1, WINDOW_SECONDS)
+    return False
+
+
+class PublicEnquiryView(APIView):
+    """POST /api/enquiries/ — public. Honeypot field `company` is dropped."""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        company = request.data.get("company", "")
+        if isinstance(company, str) and company.strip():
+            enquiry_rate_limited(request, "")
+            return Response({"ok": True}, status=status.HTTP_201_CREATED)
+
+        payload = {}
+        for field, limit in FIELD_LIMITS.items():
+            text = _text(request.data.get(field, ""), limit)
+            if text is None:
+                return Response(
+                    {"error": f"{field} must be a string"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            payload[field] = text
+
+        if not payload["name"]:
+            return Response({"error": "name is required"}, status=status.HTTP_400_BAD_REQUEST)
+        if not payload["message"]:
+            return Response({"error": "message is required"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            validate_email(payload["email"])
+        except ValidationError:
+            return Response({"error": "email is invalid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if enquiry_rate_limited(request, payload["email"]):
+            return Response(
+                {"error": "Too many enquiries. Try again later."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        enquiry = Enquiry.objects.create(**payload)
+        return Response(EnquirySerializer(enquiry).data, status=status.HTTP_201_CREATED)
+
+
+class AdminEnquiryListView(APIView):
+    permission_classes = [HasAdminKey]
+
+    def get(self, request):
+        rows = Enquiry.objects.all()
+        return Response(EnquirySerializer(rows, many=True).data)
+
+
+class AdminEnquiryDetailView(APIView):
+    permission_classes = [HasAdminKey]
+
+    def get(self, request, pk):
+        row = get_object_or_404(Enquiry, pk=pk)
+        return Response(EnquirySerializer(row).data)
+
+    def patch(self, request, pk):
+        row = get_object_or_404(Enquiry, pk=pk)
+        if "read" not in request.data or not isinstance(request.data.get("read"), bool):
+            return Response(
+                {"error": "read must be a boolean"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        row.read = request.data["read"]
+        row.save(update_fields=["read"])
+        return Response(EnquirySerializer(row).data)
+
+    def delete(self, request, pk):
+        row = get_object_or_404(Enquiry, pk=pk)
+        row.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)

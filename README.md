@@ -15,6 +15,7 @@ Public (no auth):
 - `GET  /api/projects/`            list published projects
 - `GET  /api/projects/<slug>/`    one published project
 - `GET  /api/chrome/`             site chrome JSON
+- `POST /api/enquiries/`          public enquiry (honeypot `company`, rate limited)
 
 Admin (send header `X-Admin-Key: <ARCH_ADMIN_SECRET>`):
 - `GET/POST         /api/admin/media/`                  list / upload image
@@ -25,6 +26,8 @@ Admin (send header `X-Admin-Key: <ARCH_ADMIN_SECRET>`):
 - `POST             /api/admin/projects/<slug>/gallery/` attach asset
 - `GET/PUT          /api/admin/chrome/`                 read / replace chrome JSON
 - `GET/POST/PUT     /api/admin/pin/`                    /admin PIN: state / verify / replace (stored hashed)
+- `GET              /api/admin/enquiries/`              list enquiries, newest first
+- `GET/PATCH/DELETE /api/admin/enquiries/<id>/`         read one / set `read` / delete
 
 ## Deploy to Railway (once)
 
@@ -32,8 +35,8 @@ Admin (send header `X-Admin-Key: <ARCH_ADMIN_SECRET>`):
 2. Railway -> New Project -> Deploy from GitHub repo -> pick it.
 3. Add a Postgres database. It is NOT wired in automatically: on the web
    service add the variable `DATABASE_URL=${{Postgres.DATABASE_URL}}`.
-   Without it Django falls back to SQLite inside the container, which is
-   wiped on every deploy.
+   The app refuses to start without it. SQLite is not used on Railway
+   (it used to be a silent fallback, and every deploy wiped it).
 4. Add a Volume on the web service, mount path `/data` (durable image
    storage — without it every upload is wiped on redeploy).
 5. Variables tab -> add the env vars in the next section.
@@ -55,9 +58,24 @@ yourself (I can't type secrets for you).
     MEDIA_ROOT            /data/media
     SERVE_MEDIA           True
     DB_SSL_REQUIRE        False
+    DATABASE_URL          ${{Postgres.DATABASE_URL}}
 
 `ARCH_ADMIN_SECRET` must be byte-identical to the value you set on Vercel,
 because the Next PIN admin sends it as the `X-Admin-Key` header.
+
+`DATABASE_URL` is Railway Postgres. The admin PIN is stored there as a
+Django password hash (`AdminPin.pin_hash`, never the plaintext) via
+`PUT /api/admin/pin/`. Enquiries from `POST /api/enquiries/` are rows in
+the same database. `ALLOW_SQLITE` is for local experiments only — do not
+set it on Railway.
+
+Public `POST /api/enquiries/` accepts `name`, `email`, `phone`,
+`project_type`, `site`, `stage`, `timeline`, `message`. A non-empty
+`company` field is a honeypot: the API answers 201 and stores nothing.
+Anonymous callers are limited to 10 posts an hour per `REMOTE_ADDR` and
+5 an hour per email address (429). The Next server may send
+`X-Admin-Key` plus `X-Createch-Client-Ip` so each visitor has their own
+bucket; a missing or wrong key ignores that header.
 
 Generate a secret (any one):
 
@@ -92,4 +110,5 @@ Uncomment django-storages + boto3 in requirements.txt, then set
     export DJANGO_SECRET_KEY=dev ARCH_ADMIN_SECRET=dev-secret
     python manage.py migrate
     python manage.py runserver
-    python manage.py test        # 5 smoke tests
+    # Tests use SQLite. A real run needs DATABASE_URL or:  ALLOW_SQLITE=True
+    python manage.py test
