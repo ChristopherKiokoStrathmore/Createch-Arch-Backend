@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import MediaAsset, Project, ProjectImage, SiteChrome
+from .models import Enquiry, MediaAsset, Project, ProjectImage, SiteChrome
 
 
 class MediaAssetSerializer(serializers.ModelSerializer):
@@ -63,3 +63,22 @@ class SiteChromeSerializer(serializers.ModelSerializer):
         model = SiteChrome
         fields = ["data", "updated_at"]
         read_only_fields = ["updated_at"]
+
+
+class EnquirySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Enquiry
+        fields = [
+            "id",
+            "name",
+            "email",
+            "phone",
+            "project_type",
+            "site",
+            "stage",
+            "timeline",
+            "message",
+            "created_at",
+            "read",
+        ]
+        read_only_fields = ["id", "created_at"]
