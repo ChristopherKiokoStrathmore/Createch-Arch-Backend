@@ -1,3 +1,4 @@
+from django.conf import settings
 from rest_framework import serializers
 
 from .models import Enquiry, MediaAsset, Project, ProjectImage, SiteChrome
@@ -24,6 +25,13 @@ class MediaUploadSerializer(serializers.ModelSerializer):
         model = MediaAsset
         fields = ["id", "file", "alt", "sort"]
         read_only_fields = ["id"]
+
+    def validate_file(self, uploaded):
+        limit = getattr(settings, "ARCH_MAX_UPLOAD_BYTES", 8 * 1024 * 1024)
+        size = getattr(uploaded, "size", None)
+        if size is not None and size > limit:
+            raise serializers.ValidationError(f"File exceeds the {limit} byte upload limit.")
+        return uploaded
 
 
 class ProjectImageSerializer(serializers.ModelSerializer):

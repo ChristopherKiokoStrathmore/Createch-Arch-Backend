@@ -2,19 +2,19 @@
 
 import os
 
-import django
-
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
-django.setup()
-
-from django.conf import settings
-from django.core.management import call_command
-from django.db import connection
-
 CACHE_TABLE = "createch_cache"
 
 
 def main():
+    import django
+
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+    django.setup()
+
+    from django.conf import settings
+    from django.core.management import call_command
+    from django.db import connection
+
     engine = settings.DATABASES["default"]["ENGINE"]
     if "postgresql" not in engine:
         return
