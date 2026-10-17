@@ -81,6 +81,23 @@ class ApiTests(TestCase):
         pub = self.c.get("/api/chrome/")
         self.assertEqual(pub.json()["data"]["hero"]["line"], "From line to built")
 
+    def test_public_chrome_hides_stored_draft(self):
+        payload = {
+            "data": {
+                "hero": {"line": "From line to built"},
+                "draft": {"hero": {"line": "Unpublished"}},
+            }
+        }
+        saved = self.c.put("/api/admin/chrome/", payload, format="json", **self.auth)
+        self.assertEqual(saved.status_code, 200, saved.content)
+        admin = self.c.get("/api/admin/chrome/", **self.auth)
+        self.assertEqual(admin.status_code, 200, admin.content)
+        self.assertEqual(admin.json()["data"]["draft"], {"hero": {"line": "Unpublished"}})
+        pub = self.c.get("/api/chrome/")
+        self.assertEqual(pub.status_code, 200, pub.content)
+        self.assertNotIn("draft", pub.json()["data"])
+        self.assertEqual(pub.json()["data"]["hero"]["line"], "From line to built")
+
     def test_project_publish_visibility(self):
         created = self.c.post(
             "/api/admin/projects/",

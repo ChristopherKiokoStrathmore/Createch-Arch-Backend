@@ -126,7 +126,12 @@ class PublicProjectViewSet(viewsets.ReadOnlyModelViewSet):
 class PublicChromeView(APIView):
     def get(self, request):
         chrome, _ = SiteChrome.objects.get_or_create(key=CHROME_KEY)
-        return Response(SiteChromeSerializer(chrome).data)
+        payload = dict(SiteChromeSerializer(chrome).data)
+        if isinstance(payload.get("data"), dict):
+            data = dict(payload["data"])
+            data.pop("draft", None)
+            payload["data"] = data
+        return Response(payload)
 
 
 class HealthView(APIView):
