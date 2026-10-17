@@ -26,7 +26,7 @@ Admin (send header `X-Admin-Key: <ARCH_ADMIN_SECRET>`):
 - `POST             /api/admin/projects/reorder/`       `{"order": [slug, ...]}` or `[{slug, order}, ...]`
 - `POST             /api/admin/projects/<slug>/gallery/` attach asset
 - `GET/PUT          /api/admin/chrome/`                 read / replace chrome JSON
-- `GET/POST/PUT     /api/admin/pin/`                    /admin PIN: state / verify / replace (stored hashed). POST verify is limited to 10/minute per IP (429, `Retry-After`)
+- `GET/POST/PUT     /api/admin/pin/`                    /admin PIN: state / verify / replace. Any printable Unicode, 4–128 characters, hashed and compared exactly. POST verify is limited to 10/minute per IP (429, `Retry-After`)
 - `GET              /api/admin/enquiries/`              list enquiries, newest first
 - `GET/PATCH/DELETE /api/admin/enquiries/<id>/`         read one / set `read` / delete
 
@@ -80,9 +80,14 @@ Optional size caps (defaults are fine):
 `ARCH_ADMIN_SECRET` must be byte-identical to the value you set on Vercel,
 because the Next PIN admin sends it as the `X-Admin-Key` header.
 
-`DATABASE_URL` is Railway Postgres. The admin PIN is stored there as a
-Django password hash (`AdminPin.pin_hash`, never the plaintext) via
-`PUT /api/admin/pin/`. Enquiries from `POST /api/enquiries/` are rows in
+`DATABASE_URL` is Railway Postgres. The admin PIN is a password, not a
+numeric code: letters, numbers, symbols, and spaces, any printable Unicode
+from 4 to 128 characters. `PUT /api/admin/pin/` stores it as a Django
+password hash (`AdminPin.pin_hash`, never the plaintext). Verification
+compares that hash exactly — no trimming and no case folding — so a PIN
+already stored as `1234` keeps working. A wrong PIN returns `{ok: false}`.
+Too short, too long, or non-printable input is 400. Enquiries from
+`POST /api/enquiries/` are rows in
 the same database. `ALLOW_SQLITE` is for local experiments only — do not
 set it on Railway.
 

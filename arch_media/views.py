@@ -27,7 +27,7 @@ from .serializers import (
 
 CHROME_KEY = "default"
 PIN_KEY = "default"
-PIN_MIN, PIN_MAX = 6, 64
+PIN_MIN, PIN_MAX = 4, 128
 ENQUIRY_ALIASES = {
     "project_type": "projectType",
     "site": "location",
@@ -206,6 +206,13 @@ class AdminChromeView(APIView):
         return Response(SiteChromeSerializer(chrome).data)
 
 
+def pin_error(pin):
+    """Accept any printable Unicode string in range. No trim, no case folding."""
+    if not isinstance(pin, str) or not (PIN_MIN <= len(pin) <= PIN_MAX) or not pin.isprintable():
+        return f"PIN must be {PIN_MIN}-{PIN_MAX} printable characters"
+    return None
+
+
 class PinVerifyThrottle(SimpleRateThrottle):
     """10 verification attempts per minute per IP. GET and PUT are not counted."""
 
@@ -223,6 +230,9 @@ class AdminPinView(APIView):
     GET  -> {set, version}
     POST {pin} -> {ok, set, version}      verify
     PUT  {pin} -> {set, version}          replace
+
+    A PIN is any printable Unicode string of 4 to 128 characters (letters,
+    numbers, symbols, spaces). It is hashed and compared exactly.
     """
 
     permission_classes = [HasAdminKey]
@@ -243,11 +253,9 @@ class AdminPinView(APIView):
 
     def put(self, request):
         pin = request.data.get("pin")
-        if not isinstance(pin, str) or not (PIN_MIN <= len(pin) <= PIN_MAX):
-            return Response(
-                {"error": f"PIN must be {PIN_MIN}-{PIN_MAX} characters"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        error = pin_error(pin)
+        if error:
+            return Response({"error": error}, status=status.HTTP_400_BAD_REQUEST)
         row, _ = AdminPin.objects.get_or_create(key=PIN_KEY, defaults={"pin_hash": ""})
         row.pin_hash = make_password(pin)
         row.version += 1

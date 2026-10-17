@@ -3,7 +3,7 @@ import mimetypes
 import tempfile
 from unittest.mock import patch
 
-from django.contrib.auth.hashers import check_password
+from django.contrib.auth.hashers import check_password, make_password
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -129,6 +129,44 @@ class ApiTests(TestCase):
     def test_pin_length_enforced(self):
         r = self.c.put("/api/admin/pin/", {"pin": "123"}, format="json", **self.auth)
         self.assertEqual(r.status_code, 400)
+        too_long = self.c.put("/api/admin/pin/", {"pin": "x" * 129}, format="json", **self.auth)
+        self.assertEqual(too_long.status_code, 400)
+        control = self.c.put("/api/admin/pin/", {"pin": "ab\ncd"}, format="json", **self.auth)
+        self.assertEqual(control.status_code, 400)
+
+    def test_pin_accepts_letters_symbols_spaces_and_existing_numeric(self):
+        pin = " Naïve #4! "
+        created = self.c.put("/api/admin/pin/", {"pin": pin}, format="json", **self.auth)
+        self.assertEqual(created.status_code, 200, created.content)
+        self.assertEqual(created.json(), {"set": True, "version": 1})
+        ok = self.c.post("/api/admin/pin/", {"pin": pin}, format="json", **self.auth)
+        self.assertTrue(ok.json()["ok"])
+        self.assertFalse(
+            self.c.post("/api/admin/pin/", {"pin": pin.strip()}, format="json", **self.auth).json()["ok"]
+        )
+        self.assertFalse(
+            self.c.post("/api/admin/pin/", {"pin": pin.casefold()}, format="json", **self.auth).json()["ok"]
+        )
+        wrong = self.c.post("/api/admin/pin/", {"pin": "wrong-pin"}, format="json", **self.auth)
+        self.assertEqual(wrong.status_code, 200)
+        self.assertFalse(wrong.json()["ok"])
+
+        # The live database already has this numeric PIN. Verification must
+        # accept the stored hash without setting it again.
+        AdminPin.objects.filter(key="default").delete()
+        AdminPin.objects.create(key="default", pin_hash=make_password("1234"), version=7)
+        legacy = self.c.post("/api/admin/pin/", {"pin": "1234"}, format="json", **self.auth)
+        self.assertEqual(legacy.status_code, 200, legacy.content)
+        self.assertTrue(legacy.json()["ok"])
+        self.assertEqual(legacy.json()["version"], 7)
+        self.assertFalse(
+            self.c.post("/api/admin/pin/", {"pin": "1234 "}, format="json", **self.auth).json()["ok"]
+        )
+        edges = self.c.put("/api/admin/pin/", {"pin": "1234"}, format="json", **self.auth)
+        self.assertEqual(edges.status_code, 200, edges.content)
+        self.assertTrue(
+            self.c.post("/api/admin/pin/", {"pin": "1234"}, format="json", **self.auth).json()["ok"]
+        )
 
     def test_pin_requires_key(self):
         self.assertEqual(self.c.get("/api/admin/pin/").status_code, 403)
