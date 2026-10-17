@@ -6,6 +6,7 @@ from .views import (
     AdminEnquiryDetailView,
     AdminEnquiryListView,
     AdminPinView,
+    HealthView,
     MediaAssetViewSet,
     ProjectViewSet,
     PublicChromeView,
@@ -21,6 +22,7 @@ admin_router.register(r"media", MediaAssetViewSet, basename="admin-media")
 admin_router.register(r"projects", ProjectViewSet, basename="admin-project")
 
 urlpatterns = [
+    path("health/", HealthView.as_view(), name="health"),
     path("chrome/", PublicChromeView.as_view(), name="public-chrome"),
     path("enquiries/", PublicEnquiryView.as_view(), name="public-enquiry"),
     path("", include(public_router.urls)),

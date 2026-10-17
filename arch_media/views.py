@@ -1,20 +1,21 @@
-import hmac
 from datetime import timedelta
 
 from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
 from django.core.cache import cache
-from django.core.exceptions import ValidationError
+from django.core.exceptions import RequestDataTooBig, ValidationError
 from django.core.validators import validate_email
+from django.db import connection
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.views import APIView
 
 from .models import AdminPin, Enquiry, MediaAsset, Project, ProjectImage, SiteChrome
-from .permissions import MIN_SECRET_LENGTH, HasAdminKey
+from .permissions import HasAdminKey, admin_key_matches
 from .serializers import (
     EnquirySerializer,
     MediaAssetSerializer,
@@ -27,6 +28,85 @@ from .serializers import (
 CHROME_KEY = "default"
 PIN_KEY = "default"
 PIN_MIN, PIN_MAX = 6, 64
+ENQUIRY_ALIASES = {
+    "project_type": "projectType",
+    "site": "location",
+}
+CACHE_TABLE = "createch_cache"
+
+
+def reorder_pairs(data, identity_key):
+    """Accept {"order": [...]} or a list of {identity, sort/order} objects."""
+    if isinstance(data, list):
+        entries = data
+    elif isinstance(data, dict):
+        entries = data.get("order", [])
+    else:
+        return []
+    if not isinstance(entries, list):
+        return []
+    pairs = []
+    for index, entry in enumerate(entries):
+        if isinstance(entry, dict):
+            identity = entry.get(identity_key)
+            if identity is None:
+                continue
+            explicit = entry.get("sort", entry.get("order", index))
+            if isinstance(explicit, bool) or not isinstance(explicit, int):
+                explicit = index
+            pairs.append((identity, explicit))
+        else:
+            pairs.append((entry, index))
+    return pairs
+
+
+def body_too_large(request, limit):
+    try:
+        declared = int(request.META.get("CONTENT_LENGTH") or 0)
+    except (TypeError, ValueError):
+        declared = 0
+    if declared > limit:
+        return True
+    try:
+        return len(request.body) > limit
+    except RequestDataTooBig:
+        return True
+
+
+def _enquiry_value(data, field):
+    if field in data:
+        return data.get(field, "")
+    alias = ENQUIRY_ALIASES.get(field)
+    if alias and alias in data:
+        return data.get(alias, "")
+    return ""
+
+
+def service_health():
+    """Database connectivity, plus the Postgres cache table when that is the limiter."""
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+    except Exception:
+        return False, "database"
+    backend = settings.CACHES["default"]["BACKEND"]
+    needs_table = connection.vendor == "postgresql" or backend.endswith("DatabaseCache")
+    if needs_table:
+        try:
+            present = CACHE_TABLE in connection.introspection.table_names()
+        except Exception:
+            return False, "database"
+        if not present:
+            return False, "cache"
+        return True, ""
+    try:
+        cache.set("health:ping", "ok", 10)
+        if cache.get("health:ping") != "ok":
+            return False, "cache"
+    except Exception:
+        return False, "cache"
+    return True, ""
 
 
 # ---------------------------------------------------------------- public reads
@@ -49,6 +129,19 @@ class PublicChromeView(APIView):
         return Response(SiteChromeSerializer(chrome).data)
 
 
+class HealthView(APIView):
+    """GET /api/health/ — database, and createch_cache when Postgres backs the limiter."""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request):
+        ok, error = service_health()
+        if not ok:
+            return Response({"ok": False, "error": error}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return Response({"ok": True})
+
+
 # ------------------------------------------------------------- admin (X-Admin-Key)
 
 class MediaAssetViewSet(viewsets.ModelViewSet):
@@ -65,10 +158,10 @@ class MediaAssetViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["post"])
     def reorder(self, request):
-        order = request.data.get("order", [])
-        for index, asset_id in enumerate(order):
-            MediaAsset.objects.filter(pk=asset_id).update(sort=index)
-        return Response({"status": "ok", "count": len(order)})
+        pairs = reorder_pairs(request.data, "id")
+        for asset_id, position in pairs:
+            MediaAsset.objects.filter(pk=asset_id).update(sort=position)
+        return Response({"status": "ok", "count": len(pairs)})
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
@@ -79,10 +172,10 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["post"])
     def reorder(self, request):
-        order = request.data.get("order", [])
-        for index, slug in enumerate(order):
-            Project.objects.filter(slug=slug).update(order=index)
-        return Response({"status": "ok", "count": len(order)})
+        pairs = reorder_pairs(request.data, "slug")
+        for slug, position in pairs:
+            Project.objects.filter(slug=slug).update(order=position)
+        return Response({"status": "ok", "count": len(pairs)})
 
     @action(detail=True, methods=["post"])
     def gallery(self, request, slug=None):
@@ -91,7 +184,10 @@ class ProjectViewSet(viewsets.ModelViewSet):
         item, _ = ProjectImage.objects.update_or_create(
             project=project, asset=asset, defaults={"sort": request.data.get("sort", 0)}
         )
-        return Response(ProjectImageSerializer(item).data, status=status.HTTP_201_CREATED)
+        return Response(
+            ProjectImageSerializer(item, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class AdminChromeView(APIView):
@@ -102,10 +198,23 @@ class AdminChromeView(APIView):
         return Response(SiteChromeSerializer(chrome).data)
 
     def put(self, request):
+        if body_too_large(request, settings.CHROME_MAX_BODY_BYTES):
+            return Response({"error": "payload too large"}, status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
         chrome, _ = SiteChrome.objects.get_or_create(key=CHROME_KEY)
-        chrome.data = request.data.get("data", request.data)
+        chrome.data = request.data.get("data", request.data) if hasattr(request.data, "get") else request.data
         chrome.save()
         return Response(SiteChromeSerializer(chrome).data)
+
+
+class PinVerifyThrottle(SimpleRateThrottle):
+    """10 verification attempts per minute per IP. GET and PUT are not counted."""
+
+    scope = "pin_verify"
+
+    def get_cache_key(self, request, view):
+        if request.method != "POST":
+            return None
+        return self.cache_format % {"scope": self.scope, "ident": self.get_ident(request)}
 
 
 class AdminPinView(APIView):
@@ -117,6 +226,7 @@ class AdminPinView(APIView):
     """
 
     permission_classes = [HasAdminKey]
+    throttle_classes = [PinVerifyThrottle]
 
     @staticmethod
     def state(row):
@@ -176,9 +286,7 @@ def _text(value, limit):
 def _admin_key_ok(request):
     secret = getattr(settings, "ARCH_ADMIN_SECRET", "") or ""
     provided = request.headers.get("X-Admin-Key", "") or ""
-    if len(secret) < MIN_SECRET_LENGTH or len(provided) != len(secret):
-        return False
-    return hmac.compare_digest(provided, secret)
+    return admin_key_matches(provided, secret)
 
 
 def client_ip(request):
@@ -205,7 +313,15 @@ def enquiry_rate_limited(request, email):
         >= EMAIL_LIMIT
     ):
         return True
-    cache.set(ip_key, hits + 1, WINDOW_SECONDS)
+    # The timeout is set on the first hit and left alone after that, so a
+    # steady drip cannot keep the window open forever.
+    if not hits:
+        cache.set(ip_key, 1, WINDOW_SECONDS)
+    else:
+        try:
+            cache.incr(ip_key)
+        except ValueError:
+            cache.set(ip_key, 1, WINDOW_SECONDS)
     return False
 
 
@@ -216,6 +332,10 @@ class PublicEnquiryView(APIView):
     permission_classes = []
 
     def post(self, request):
+        if body_too_large(request, settings.ENQUIRY_MAX_BODY_BYTES):
+            return Response({"error": "payload too large"}, status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
+        if not hasattr(request.data, "get"):
+            return Response({"error": "JSON object required"}, status=status.HTTP_400_BAD_REQUEST)
         company = request.data.get("company", "")
         if isinstance(company, str) and company.strip():
             enquiry_rate_limited(request, "")
@@ -223,7 +343,7 @@ class PublicEnquiryView(APIView):
 
         payload = {}
         for field, limit in FIELD_LIMITS.items():
-            text = _text(request.data.get(field, ""), limit)
+            text = _text(_enquiry_value(request.data, field), limit)
             if text is None:
                 return Response(
                     {"error": f"{field} must be a string"},

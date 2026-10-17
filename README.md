@@ -12,6 +12,7 @@ It is a standalone Railway service. It does not touch any other backend.
 ## API surface
 
 Public (no auth):
+- `GET  /api/health/`             `{ok: true}` or 503. Checks the database, and `createch_cache` on Postgres
 - `GET  /api/projects/`            list published projects
 - `GET  /api/projects/<slug>/`    one published project
 - `GET  /api/chrome/`             site chrome JSON
@@ -19,13 +20,13 @@ Public (no auth):
 
 Admin (send header `X-Admin-Key: <ARCH_ADMIN_SECRET>`):
 - `GET/POST         /api/admin/media/`                  list / upload image
-- `POST             /api/admin/media/reorder/`          [{id, sort}, ...]
+- `POST             /api/admin/media/reorder/`          `{"order": [id, ...]}` or `[{id, sort}, ...]`
 - `GET/POST         /api/admin/projects/`               list / create project
 - `PATCH/DELETE     /api/admin/projects/<slug>/`        edit / delete
-- `POST             /api/admin/projects/reorder/`       [{slug, order}, ...]
+- `POST             /api/admin/projects/reorder/`       `{"order": [slug, ...]}` or `[{slug, order}, ...]`
 - `POST             /api/admin/projects/<slug>/gallery/` attach asset
 - `GET/PUT          /api/admin/chrome/`                 read / replace chrome JSON
-- `GET/POST/PUT     /api/admin/pin/`                    /admin PIN: state / verify / replace (stored hashed)
+- `GET/POST/PUT     /api/admin/pin/`                    /admin PIN: state / verify / replace (stored hashed). POST verify is limited to 10/minute per IP (429, `Retry-After`)
 - `GET              /api/admin/enquiries/`              list enquiries, newest first
 - `GET/PATCH/DELETE /api/admin/enquiries/<id>/`         read one / set `read` / delete
 
@@ -46,19 +47,35 @@ Admin (send header `X-Admin-Key: <ARCH_ADMIN_SECRET>`):
 
 ## Environment variables
 
-Set these in Railway -> Variables. You must type the two secret values
-yourself (I can't type secrets for you).
+Set these in Railway -> Variables before deploying. The process logs one
+warning line at startup, `Missing environment variables: ...`, naming every
+required variable that is still empty. It refuses to boot when `DEBUG` is
+off and `DJANGO_SECRET_KEY` is missing, shorter than 32 characters, or still
+the dev default.
 
-    DJANGO_SECRET_KEY     <paste a long random string>
-    ARCH_ADMIN_SECRET     <paste a long random string>
+Confirm these on Railway (the deploy will not start without the first one):
+
+    DJANGO_SECRET_KEY     required, 32+ random characters, not the dev default
+    DATABASE_URL          ${{Postgres.DATABASE_URL}}
+    ARCH_ADMIN_SECRET     required for admin writes, 32+ characters, same value as Vercel
     DEBUG                 False
-    ALLOWED_HOSTS         .railway.app,createch.co.ke,www.createch.co.ke
+    ALLOWED_HOSTS         optional. If unset, defaults to .up.railway.app,createch.co.ke,www.createch.co.ke
     CSRF_TRUSTED_ORIGINS  https://createch.co.ke,https://www.createch.co.ke
     CORS_ALLOWED_ORIGINS  https://createch.co.ke,https://www.createch.co.ke
     MEDIA_ROOT            /data/media
     SERVE_MEDIA           True
     DB_SSL_REQUIRE        False
-    DATABASE_URL          ${{Postgres.DATABASE_URL}}
+
+`ALLOWED_HOSTS` is not `*` in production. Leaving it unset still serves
+`*.up.railway.app`, `createch.co.ke`, and `www.createch.co.ke`. Set it
+explicitly if you add another domain. A leading dot matches subdomains.
+
+Optional size caps (defaults are fine):
+
+    DATA_UPLOAD_MAX_MEMORY_SIZE   1048576     JSON parse cap, bytes
+    ARCH_MAX_UPLOAD_BYTES         8388608     image upload cap, bytes
+    ENQUIRY_MAX_BODY_BYTES        32768
+    CHROME_MAX_BODY_BYTES         524288
 
 `ARCH_ADMIN_SECRET` must be byte-identical to the value you set on Vercel,
 because the Next PIN admin sends it as the `X-Admin-Key` header.
@@ -70,8 +87,12 @@ the same database. `ALLOW_SQLITE` is for local experiments only — do not
 set it on Railway.
 
 Public `POST /api/enquiries/` accepts `name`, `email`, `phone`,
-`project_type`, `site`, `stage`, `timeline`, `message`. A non-empty
-`company` field is a honeypot: the API answers 201 and stores nothing.
+`project_type`, `site`, `stage`, `timeline`, `message`. `projectType` is
+accepted as an alias of `project_type`, and `location` as an alias of
+`site`. If both the canonical name and the alias are sent, the canonical
+name wins. A non-empty `company` field is a honeypot: the API answers 201
+and stores nothing. Bodies over `ENQUIRY_MAX_BODY_BYTES` (and chrome writes
+over `CHROME_MAX_BODY_BYTES`) return 413.
 Anonymous callers are limited to 10 posts an hour per `REMOTE_ADDR` and
 5 an hour per email address (429). The Next server may send
 `X-Admin-Key` plus `X-Createch-Client-Ip` so each visitor has their own
@@ -99,6 +120,7 @@ Uncomment django-storages + boto3 in requirements.txt, then set
 
 ## Verify after deploy
 
+    curl https://<service>.railway.app/api/health/
     curl https://<service>.railway.app/api/chrome/
     curl https://<service>.railway.app/api/projects/
     # admin check (should return 200 with the key, 403 without):
@@ -106,9 +128,17 @@ Uncomment django-storages + boto3 in requirements.txt, then set
 
 ## Run locally
 
-    pip install -r requirements.txt
-    export DJANGO_SECRET_KEY=dev ARCH_ADMIN_SECRET=dev-secret
+`DEBUG=True` or `ALLOW_SQLITE=True` keeps a short `DJANGO_SECRET_KEY` working
+on your machine. Neither flag relaxes that check on Railway.
+`ARCH_ADMIN_SECRET` must still be at least 32 characters or every admin
+route returns 403.
+
+    pip install -r requirements.txt -r requirements-dev.txt
+    export DEBUG=True ALLOW_SQLITE=True
+    export DJANGO_SECRET_KEY=local-dev-only-change-me-not-for-prod
+    export ARCH_ADMIN_SECRET=local-dev-admin-secret-not-for-production
     python manage.py migrate
     python manage.py runserver
-    # Tests use SQLite. A real run needs DATABASE_URL or:  ALLOW_SQLITE=True
     python manage.py test
+    ruff check .
+    pip-audit -r requirements.txt
