@@ -67,8 +67,24 @@ class SiteChrome(models.Model):
         return f"SiteChrome<{self.key}>"
 
 
+class ChromeVersion(models.Model):
+    """A previous published chrome document. Drafts are not stored here."""
+
+    label = models.CharField(max_length=80)
+    data = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return self.label
+
+
 class Enquiry(models.Model):
     """A public contact-form submission. Bytes of the message live in Postgres."""
+
+    STATUS_CHOICES = [("new", "New"), ("replied", "Replied"), ("archived", "Archived")]
 
     name = models.CharField(max_length=120)
     email = models.EmailField(max_length=200)
@@ -78,6 +94,7 @@ class Enquiry(models.Model):
     stage = models.CharField(max_length=120, blank=True)
     timeline = models.CharField(max_length=200, blank=True)
     message = models.TextField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="new")
     created_at = models.DateTimeField(auto_now_add=True)
     read = models.BooleanField(default=False)
 

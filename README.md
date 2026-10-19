@@ -15,20 +15,23 @@ Public (no auth):
 - `GET  /api/health/`             `{ok: true}` or 503. Checks the database, and `createch_cache` on Postgres
 - `GET  /api/projects/`            list published projects
 - `GET  /api/projects/<slug>/`    one published project
-- `GET  /api/chrome/`             site chrome JSON
-- `POST /api/enquiries/`          public enquiry (honeypot `company`, rate limited)
+- `GET  /api/chrome/`             site chrome JSON, without `draft` or `versions`
+- `POST /api/enquiries/`          public enquiry (honeypot `company`, rate limited). Stored with `status: "new"`
 
 Admin (send header `X-Admin-Key: <ARCH_ADMIN_SECRET>`):
-- `GET/POST         /api/admin/media/`                  list / upload image
+- `GET/POST         /api/admin/media/`                  list / upload image (long edge capped at 2400px, EXIF removed, WebP or JPEG)
 - `POST             /api/admin/media/reorder/`          `{"order": [id, ...]}` or `[{id, sort}, ...]`
 - `GET/POST         /api/admin/projects/`               list / create project
 - `PATCH/DELETE     /api/admin/projects/<slug>/`        edit / delete
 - `POST             /api/admin/projects/reorder/`       `{"order": [slug, ...]}` or `[{slug, order}, ...]`
 - `POST             /api/admin/projects/<slug>/gallery/` attach asset
-- `GET/PUT          /api/admin/chrome/`                 read / replace chrome JSON
+- `GET/PUT          /api/admin/chrome/`                 read / replace chrome JSON. Each publish keeps the previous public document
+- `GET              /api/admin/chrome/versions/`        last 10 published versions (`id`, `label`, `created_at`, `data`)
+- `POST             /api/admin/chrome/versions/<id>/restore/`  publish that version; the current `draft` stays
 - `GET/POST/PUT     /api/admin/pin/`                    /admin PIN: state / verify / replace. Any printable Unicode, 4–128 characters, hashed and compared exactly. POST verify is limited to 10/minute per IP (429, `Retry-After`)
-- `GET              /api/admin/enquiries/`              list enquiries, newest first
-- `GET/PATCH/DELETE /api/admin/enquiries/<id>/`         read one / set `read` / delete
+- `GET              /api/admin/enquiries/?status=`      paginated inbox, newest first. `status` is `new`, `replied`, or `archived`
+- `GET              /api/admin/enquiries/summary/`      `{"new": 0, "replied": 0, "archived": 0}`
+- `GET/PATCH/DELETE /api/admin/enquiries/<id>/`         read one / set `{"status": "replied"}` / delete
 
 ## Deploy to Railway (once)
 
@@ -76,6 +79,17 @@ Optional size caps (defaults are fine):
     ARCH_MAX_UPLOAD_BYTES         8388608     image upload cap, bytes
     ENQUIRY_MAX_BODY_BYTES        32768
     CHROME_MAX_BODY_BYTES         524288
+
+Email alerts are optional. If any of these are unset, enquiries are still
+saved and the process logs a warning instead of failing the request:
+
+    EMAIL_HOST
+    EMAIL_PORT
+    EMAIL_HOST_USER
+    EMAIL_HOST_PASSWORD
+    EMAIL_USE_TLS          true or false
+    DEFAULT_FROM_EMAIL
+    ENQUIRY_NOTIFY_TO      comma-separated recipients
 
 `ARCH_ADMIN_SECRET` must be byte-identical to the value you set on Vercel,
 because the Next PIN admin sends it as the `X-Admin-Key` header.

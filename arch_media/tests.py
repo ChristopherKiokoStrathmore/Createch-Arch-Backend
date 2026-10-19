@@ -1,5 +1,6 @@
 import io
 import mimetypes
+import os
 import tempfile
 from unittest.mock import patch
 
@@ -97,6 +98,67 @@ class ApiTests(TestCase):
         self.assertEqual(pub.status_code, 200, pub.content)
         self.assertNotIn("draft", pub.json()["data"])
         self.assertEqual(pub.json()["data"]["hero"]["line"], "From line to built")
+
+    def test_chrome_versions_restore_keeps_draft_and_stay_private(self):
+        denied = self.c.get("/api/admin/chrome/versions/")
+        self.assertEqual(denied.status_code, 403)
+        first = self.c.put(
+            "/api/admin/chrome/",
+            {"data": {"hero": "A", "draft": {"note": "keep me"}, "versions": [{"id": 1}]}},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(first.status_code, 200, first.content)
+        second = self.c.put(
+            "/api/admin/chrome/",
+            {"data": {"hero": "B", "draft": {"note": "keep me"}}},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(second.status_code, 200, second.content)
+        listing = self.c.get("/api/admin/chrome/versions/", **self.auth)
+        self.assertEqual(listing.status_code, 200, listing.content)
+        versions = listing.json()
+        self.assertEqual(len(versions), 1)
+        self.assertEqual(versions[0]["data"], {"hero": "A"})
+        self.assertNotIn("draft", versions[0]["data"])
+        self.assertNotIn("versions", versions[0]["data"])
+        self.assertTrue(versions[0]["label"])
+        self.assertIn("created_at", versions[0])
+
+        restored = self.c.post(
+            f"/api/admin/chrome/versions/{versions[0]['id']}/restore/",
+            {},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(restored.status_code, 200, restored.content)
+        self.assertEqual(restored.json()["data"]["hero"], "A")
+        self.assertEqual(restored.json()["data"]["draft"], {"note": "keep me"})
+        self.assertNotIn("versions", restored.json()["data"])
+        admin = self.c.get("/api/admin/chrome/", **self.auth)
+        self.assertEqual(admin.json()["data"]["draft"], {"note": "keep me"})
+        public = self.c.get("/api/chrome/").json()["data"]
+        self.assertEqual(public, {"hero": "A"})
+        self.assertNotIn("draft", public)
+        self.assertNotIn("versions", public)
+        missing = self.c.post("/api/admin/chrome/versions/9999/restore/", {}, format="json", **self.auth)
+        self.assertEqual(missing.status_code, 404)
+
+        for index in range(12):
+            saved = self.c.put(
+                "/api/admin/chrome/",
+                {"data": {"hero": f"v{index}", "draft": {"note": "keep me"}}},
+                format="json",
+                **self.auth,
+            )
+            self.assertEqual(saved.status_code, 200, saved.content)
+        history = self.c.get("/api/admin/chrome/versions/", **self.auth).json()
+        self.assertEqual(len(history), 10)
+        stored = {row["data"]["hero"] for row in history}
+        self.assertNotIn("A", stored)
+        self.assertIn("v10", stored)
+        self.assertNotIn("v11", stored)
 
     def test_project_publish_visibility(self):
         created = self.c.post(
@@ -207,8 +269,9 @@ class ApiTests(TestCase):
         self.assertEqual(body["name"], "Amina Okello")
         self.assertEqual(body["project_type"], "Hotel or lodge")
         self.assertEqual(body["site"], "Nairobi")
-        self.assertFalse(body["read"])
+        self.assertEqual(body["status"], "new")
         self.assertIn("created_at", body)
+        self.assertNotIn("read", body)
         self.assertEqual(Enquiry.objects.count(), 1)
 
         denied = self.c.get("/api/admin/enquiries/")
@@ -216,20 +279,22 @@ class ApiTests(TestCase):
 
         listing = self.c.get("/api/admin/enquiries/", **self.auth)
         self.assertEqual(listing.status_code, 200)
-        self.assertEqual(len(listing.json()), 1)
+        self.assertEqual(listing.json()["count"], 1)
+        self.assertEqual(len(listing.json()["results"]), 1)
+        self.assertEqual(listing.json()["results"][0]["id"], body["id"])
 
         patched = self.c.patch(
             f"/api/admin/enquiries/{body['id']}/",
-            {"read": True},
+            {"status": "replied"},
             format="json",
             **self.auth,
         )
         self.assertEqual(patched.status_code, 200)
-        self.assertTrue(patched.json()["read"])
+        self.assertEqual(patched.json()["status"], "replied")
         self.assertEqual(
             self.c.patch(
                 f"/api/admin/enquiries/{body['id']}/",
-                {"read": "yes"},
+                {"status": "yes"},
                 format="json",
                 **self.auth,
             ).status_code,
@@ -242,6 +307,120 @@ class ApiTests(TestCase):
         deleted = self.c.delete(f"/api/admin/enquiries/{body['id']}/", **self.auth)
         self.assertEqual(deleted.status_code, 204)
         self.assertEqual(Enquiry.objects.count(), 0)
+
+    def test_site_enquiry_form_is_stored(self):
+        form = {
+            "name": "Amina Okello",
+            "email": "form@example.com",
+            "phone": "+254700000000",
+            "projectType": "Restaurant, bar or café",
+            "location": "Mombasa",
+            "stage": "Just an idea",
+            "timeline": "On site by June",
+            "message": "A terrace and a small bar.",
+            "company": "",
+        }
+        saved = self.c.post("/api/enquiries/", form, format="multipart")
+        self.assertEqual(saved.status_code, 201, saved.content)
+        row = Enquiry.objects.get(email="form@example.com")
+        self.assertEqual(row.project_type, "Restaurant, bar or café")
+        self.assertEqual(row.site, "Mombasa")
+        self.assertEqual(row.stage, "Just an idea")
+        self.assertEqual(row.timeline, "On site by June")
+        self.assertEqual(row.message, "A terrace and a small bar.")
+        self.assertEqual(row.status, "new")
+        self.assertIsNotNone(row.created_at)
+
+        numbered = self.c.post(
+            "/api/enquiries/",
+            {"name": "Num", "email": "num@example.com", "phone": 254700000000, "message": "Call me"},
+            format="json",
+        )
+        self.assertEqual(numbered.status_code, 201, numbered.content)
+        self.assertEqual(Enquiry.objects.get(email="num@example.com").phone, "254700000000")
+
+    def test_enquiry_inbox_filter_summary_and_order(self):
+        for index, enquiry_status in enumerate(("new", "replied", "archived", "new")):
+            Enquiry.objects.create(
+                name=f"Person {index}",
+                email=f"box{index}@example.com",
+                message="Hello",
+                status=enquiry_status,
+            )
+        denied = self.c.get("/api/admin/enquiries/summary/")
+        self.assertEqual(denied.status_code, 403)
+        summary = self.c.get("/api/admin/enquiries/summary/", **self.auth)
+        self.assertEqual(summary.status_code, 200)
+        self.assertEqual(summary.json(), {"new": 2, "replied": 1, "archived": 1})
+
+        newest = self.c.get("/api/admin/enquiries/", **self.auth)
+        self.assertEqual([row["name"] for row in newest.json()["results"]], ["Person 3", "Person 2", "Person 1", "Person 0"])
+        replied = self.c.get("/api/admin/enquiries/?status=replied", **self.auth)
+        self.assertEqual(replied.json()["count"], 1)
+        self.assertEqual(replied.json()["results"][0]["status"], "replied")
+        bad = self.c.get("/api/admin/enquiries/?status=read", **self.auth)
+        self.assertEqual(bad.status_code, 400)
+
+        for index in range(21):
+            Enquiry.objects.create(name=f"Page {index}", email=f"page{index}@example.com", message="Hello")
+        first = self.c.get("/api/admin/enquiries/", **self.auth)
+        self.assertEqual(first.json()["count"], 25)
+        self.assertEqual(len(first.json()["results"]), 20)
+        self.assertEqual(first.json()["results"][0]["name"], "Page 20")
+        second = self.c.get("/api/admin/enquiries/?page=2", **self.auth)
+        self.assertEqual(len(second.json()["results"]), 5)
+        self.assertIsNone(second.json()["next"])
+
+    def test_enquiry_email_is_best_effort(self):
+        mail_env = {
+            "EMAIL_HOST": "smtp.example.com",
+            "EMAIL_PORT": "587",
+            "EMAIL_HOST_USER": "studio@createch.co.ke",
+            "EMAIL_HOST_PASSWORD": "secret-not-logged",
+            "EMAIL_USE_TLS": "true",
+            "DEFAULT_FROM_EMAIL": "studio@createch.co.ke",
+            "ENQUIRY_NOTIFY_TO": "anvi@createch.co.ke, studio@createch.co.ke",
+        }
+        with patch.dict(os.environ, mail_env, clear=False):
+            with patch("arch_media.views.send_mail") as send:
+                saved = self.c.post("/api/enquiries/", self.enquiry(email="mail@example.com"), format="json")
+        self.assertEqual(saved.status_code, 201, saved.content)
+        self.assertEqual(Enquiry.objects.filter(email="mail@example.com").count(), 1)
+        send.assert_called_once()
+        kwargs = send.call_args.kwargs
+        self.assertEqual(kwargs["recipient_list"], ["anvi@createch.co.ke", "studio@createch.co.ke"])
+        self.assertEqual(kwargs["from_email"], "studio@createch.co.ke")
+        self.assertIn("Amina Okello", kwargs["message"])
+        self.assertIn("mail@example.com", kwargs["message"])
+        self.assertIn("A short note about the site.", kwargs["message"])
+        self.assertIn("https://createch.co.ke/admin", kwargs["message"])
+        self.assertNotIn("secret-not-logged", kwargs["message"])
+
+        with patch.dict(os.environ, mail_env, clear=False):
+            with patch("arch_media.views.send_mail", side_effect=OSError("smtp down")):
+                with self.assertLogs("arch_media.views", level="WARNING") as failed:
+                    still = self.c.post(
+                        "/api/enquiries/",
+                        self.enquiry(email="failed-mail@example.com"),
+                        format="json",
+                    )
+        self.assertEqual(still.status_code, 201, still.content)
+        self.assertEqual(Enquiry.objects.filter(email="failed-mail@example.com").count(), 1)
+        self.assertTrue(any("email alert failed" in line for line in failed.output))
+
+        blank = {key: "" for key in mail_env}
+        with patch.dict(os.environ, blank, clear=False):
+            with patch("arch_media.views.send_mail") as send:
+                with self.assertLogs("arch_media.views", level="WARNING") as missing:
+                    quiet = self.c.post(
+                        "/api/enquiries/",
+                        self.enquiry(email="no-mail@example.com"),
+                        format="json",
+                    )
+        self.assertEqual(quiet.status_code, 201, quiet.content)
+        self.assertEqual(Enquiry.objects.filter(email="no-mail@example.com").count(), 1)
+        send.assert_not_called()
+        self.assertTrue(any("mail environment is incomplete" in line for line in missing.output))
 
     def test_honeypot_is_not_stored(self):
         r = self.c.post(
@@ -523,7 +702,7 @@ class ApiTests(TestCase):
         self.assertEqual(mimetypes.guess_type("hero.jpg")[0], "image/jpeg")
         self.assertEqual(mimetypes.guess_type("hero.gif")[0], "image/gif")
         buf = io.BytesIO()
-        Image.new("RGB", (2, 2), (1, 2, 3)).save(buf, format="WEBP")
+        Image.new("RGBA", (2, 2), (1, 2, 3, 128)).save(buf, format="WEBP")
         uploaded = self.c.post(
             "/api/admin/media/",
             {"file": SimpleUploadedFile("hero.webp", buf.getvalue(), content_type="image/webp"), "alt": "webp"},
@@ -534,6 +713,59 @@ class ApiTests(TestCase):
         relative = uploaded.json()["url"].split("/media/", 1)[1]
         response = serve(RequestFactory().get("/media/" + relative), relative, document_root=MEDIA)
         self.assertEqual(response["Content-Type"], "image/webp")
+        self.assertTrue(relative.endswith(".webp"))
+
+    def test_upload_is_resized_and_exif_is_stripped(self):
+        image = Image.new("RGB", (3000, 1200), (8, 16, 24))
+        exif = image.getexif()
+        exif[270] = "secret-camera"
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", exif=exif.tobytes(), quality=95)
+        uploaded = self.c.post(
+            "/api/admin/media/",
+            {
+                "file": SimpleUploadedFile("wide.jpg", buf.getvalue(), content_type="image/jpeg"),
+                "alt": "wide",
+            },
+            format="multipart",
+            **self.auth,
+        )
+        self.assertEqual(uploaded.status_code, 201, uploaded.content)
+        body = uploaded.json()
+        self.assertEqual(body["width"], 2400)
+        self.assertEqual(body["height"], 960)
+        self.assertTrue(body["url"].endswith(".jpg"))
+        asset = MediaAsset.objects.get(pk=body["id"])
+        with asset.file.open("rb") as handle:
+            saved = Image.open(handle)
+            saved.load()
+            self.assertEqual(saved.format, "JPEG")
+            self.assertLessEqual(max(saved.size), 2400)
+            self.assertFalse(saved.getexif())
+
+        alpha = io.BytesIO()
+        Image.new("RGBA", (10, 20), (1, 2, 3, 200)).save(alpha, format="PNG")
+        webp = self.c.post(
+            "/api/admin/media/",
+            {
+                "file": SimpleUploadedFile("mark.png", alpha.getvalue(), content_type="image/png"),
+                "alt": "mark",
+            },
+            format="multipart",
+            **self.auth,
+        )
+        self.assertEqual(webp.status_code, 201, webp.content)
+        self.assertTrue(webp.json()["url"].endswith(".webp"))
+        self.assertEqual(webp.json()["width"], 10)
+        self.assertEqual(webp.json()["height"], 20)
+
+        rejected = self.c.post(
+            "/api/admin/media/",
+            {"file": SimpleUploadedFile("notes.txt", b"not an image", content_type="text/plain"), "alt": "nope"},
+            format="multipart",
+            **self.auth,
+        )
+        self.assertEqual(rejected.status_code, 400, rejected.content)
 
     def test_health_ok(self):
         response = self.c.get("/api/health/")

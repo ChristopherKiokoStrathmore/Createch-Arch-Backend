@@ -1,22 +1,28 @@
+import logging
+import os
 from datetime import timedelta
 
 from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
 from django.core.cache import cache
 from django.core.exceptions import RequestDataTooBig, ValidationError
+from django.core.mail import get_connection, send_mail
 from django.core.validators import validate_email
 from django.db import connection
+from django.db.models import Count
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.views import APIView
 
-from .models import AdminPin, Enquiry, MediaAsset, Project, ProjectImage, SiteChrome
+from .models import AdminPin, ChromeVersion, Enquiry, MediaAsset, Project, ProjectImage, SiteChrome
 from .permissions import HasAdminKey, admin_key_matches
 from .serializers import (
+    ChromeVersionSerializer,
     EnquirySerializer,
     MediaAssetSerializer,
     MediaUploadSerializer,
@@ -26,6 +32,8 @@ from .serializers import (
 )
 
 CHROME_KEY = "default"
+VERSION_KEEP = 10
+PUBLIC_CHROME_OMIT = ("draft", "versions")
 PIN_KEY = "default"
 PIN_MIN, PIN_MAX = 4, 128
 ENQUIRY_ALIASES = {
@@ -129,7 +137,8 @@ class PublicChromeView(APIView):
         payload = dict(SiteChromeSerializer(chrome).data)
         if isinstance(payload.get("data"), dict):
             data = dict(payload["data"])
-            data.pop("draft", None)
+            for key in PUBLIC_CHROME_OMIT:
+                data.pop(key, None)
             payload["data"] = data
         return Response(payload)
 
@@ -195,6 +204,29 @@ class ProjectViewSet(viewsets.ModelViewSet):
         )
 
 
+def published_document(data):
+    """Chrome JSON as the public site sees it: no draft and no version list."""
+    if not isinstance(data, dict):
+        return {}
+    cleaned = dict(data)
+    for key in PUBLIC_CHROME_OMIT:
+        cleaned.pop(key, None)
+    return cleaned
+
+
+def archive_published(chrome):
+    """Keep the current published document, then drop anything past the last 10."""
+    published = published_document(chrome.data)
+    if not published:
+        return None
+    when = timezone.localtime(chrome.updated_at or timezone.now())
+    ChromeVersion.objects.create(label=when.strftime("%d %b %Y, %H:%M")[:80], data=published)
+    extra = list(ChromeVersion.objects.order_by("-created_at", "-id").values_list("id", flat=True)[VERSION_KEEP:])
+    if extra:
+        ChromeVersion.objects.filter(pk__in=extra).delete()
+    return published
+
+
 class AdminChromeView(APIView):
     permission_classes = [HasAdminKey]
 
@@ -206,7 +238,35 @@ class AdminChromeView(APIView):
         if body_too_large(request, settings.CHROME_MAX_BODY_BYTES):
             return Response({"error": "payload too large"}, status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
         chrome, _ = SiteChrome.objects.get_or_create(key=CHROME_KEY)
+        archive_published(chrome)
         chrome.data = request.data.get("data", request.data) if hasattr(request.data, "get") else request.data
+        chrome.save()
+        return Response(SiteChromeSerializer(chrome).data)
+
+
+class ChromeVersionListView(APIView):
+    permission_classes = [HasAdminKey]
+
+    def get(self, request):
+        rows = ChromeVersion.objects.all()
+        return Response(ChromeVersionSerializer(rows, many=True).data)
+
+
+class ChromeVersionRestoreView(APIView):
+    permission_classes = [HasAdminKey]
+
+    def post(self, request, pk):
+        version = get_object_or_404(ChromeVersion, pk=pk)
+        chrome, _ = SiteChrome.objects.get_or_create(key=CHROME_KEY)
+        current = chrome.data if isinstance(chrome.data, dict) else {}
+        draft = current.get("draft") if isinstance(current, dict) and "draft" in current else None
+        incoming = published_document(version.data)
+        if published_document(current) != incoming:
+            archive_published(chrome)
+        restored = dict(incoming)
+        if draft is not None:
+            restored["draft"] = draft
+        chrome.data = restored
         chrome.save()
         return Response(SiteChromeSerializer(chrome).data)
 
@@ -270,6 +330,7 @@ class AdminPinView(APIView):
 
 # ---------------------------------------------------------------- enquiries
 
+logger = logging.getLogger(__name__)
 IP_LIMIT = 10
 EMAIL_LIMIT = 5
 WINDOW_SECONDS = 60 * 60
@@ -286,8 +347,15 @@ FIELD_LIMITS = {
 
 
 def _text(value, limit):
+    """Coerce a form or JSON value into a stored string. None means the value is unusable."""
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
     if value is None:
         return ""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        value = str(value)
     if not isinstance(value, str):
         return None
     cleaned = "".join(
@@ -338,6 +406,93 @@ def enquiry_rate_limited(request, email):
     return False
 
 
+MAIL_ENV_VARS = (
+    "EMAIL_HOST",
+    "EMAIL_PORT",
+    "EMAIL_HOST_USER",
+    "EMAIL_HOST_PASSWORD",
+    "EMAIL_USE_TLS",
+    "DEFAULT_FROM_EMAIL",
+    "ENQUIRY_NOTIFY_TO",
+)
+ADMIN_INBOX_URL = "https://createch.co.ke/admin"
+
+
+def _mail_config():
+    """SMTP settings taken only from the environment. Incomplete config means no send."""
+    values = {name: (os.environ.get(name) or "").strip() for name in MAIL_ENV_VARS}
+    if not all(values.values()):
+        return None
+    try:
+        port = int(values["EMAIL_PORT"])
+    except ValueError:
+        return None
+    if port <= 0:
+        return None
+    recipients = [part.strip() for part in values["ENQUIRY_NOTIFY_TO"].split(",") if part.strip()]
+    if not recipients:
+        return None
+    use_tls = values["EMAIL_USE_TLS"].lower() in ("1", "true", "yes", "on")
+    return {
+        "host": values["EMAIL_HOST"],
+        "port": port,
+        "username": values["EMAIL_HOST_USER"],
+        "password": os.environ.get("EMAIL_HOST_PASSWORD") or "",
+        "use_tls": use_tls,
+        "from_email": values["DEFAULT_FROM_EMAIL"],
+        "recipients": recipients,
+    }
+
+
+def notify_new_enquiry(enquiry):
+    """Best-effort alert. A missing setting or a send failure never blocks the saved row."""
+    try:
+        config = _mail_config()
+        if config is None:
+            logger.warning(
+                "Enquiry %s saved but email alert was not sent: mail environment is incomplete",
+                enquiry.pk,
+            )
+            return
+        body = "\n".join(
+            [
+                f"Name: {enquiry.name}",
+                f"Email: {enquiry.email}",
+                f"Phone: {enquiry.phone}",
+                f"Project: {enquiry.project_type}",
+                f"Site: {enquiry.site}",
+                f"Stage: {enquiry.stage}",
+                f"Timeline: {enquiry.timeline}",
+                "",
+                enquiry.message,
+                "",
+                ADMIN_INBOX_URL,
+            ]
+        )
+        connection = get_connection(
+            backend="django.core.mail.backends.smtp.EmailBackend",
+            host=config["host"],
+            port=config["port"],
+            username=config["username"],
+            password=config["password"],
+            use_tls=config["use_tls"],
+        )
+        send_mail(
+            subject=f"New enquiry from {enquiry.name}",
+            message=body,
+            from_email=config["from_email"],
+            recipient_list=config["recipients"],
+            connection=connection,
+            fail_silently=False,
+        )
+    except Exception:
+        logger.warning(
+            "Enquiry %s saved but the email alert failed",
+            getattr(enquiry, "pk", None),
+            exc_info=True,
+        )
+
+
 class PublicEnquiryView(APIView):
     """POST /api/enquiries/ — public. Honeypot field `company` is dropped."""
 
@@ -349,8 +504,8 @@ class PublicEnquiryView(APIView):
             return Response({"error": "payload too large"}, status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
         if not hasattr(request.data, "get"):
             return Response({"error": "JSON object required"}, status=status.HTTP_400_BAD_REQUEST)
-        company = request.data.get("company", "")
-        if isinstance(company, str) and company.strip():
+        company = _text(request.data.get("company", ""), 200)
+        if company:
             enquiry_rate_limited(request, "")
             return Response({"ok": True}, status=status.HTTP_201_CREATED)
 
@@ -380,15 +535,42 @@ class PublicEnquiryView(APIView):
             )
 
         enquiry = Enquiry.objects.create(**payload)
+        notify_new_enquiry(enquiry)
         return Response(EnquirySerializer(enquiry).data, status=status.HTTP_201_CREATED)
+
+
+class EnquiryPagination(PageNumberPagination):
+    page_size = 20
 
 
 class AdminEnquiryListView(APIView):
     permission_classes = [HasAdminKey]
 
     def get(self, request):
+        chosen = (request.query_params.get("status") or "").strip()
         rows = Enquiry.objects.all()
-        return Response(EnquirySerializer(rows, many=True).data)
+        if chosen:
+            if chosen not in dict(Enquiry.STATUS_CHOICES):
+                return Response(
+                    {"error": "status must be new, replied, or archived"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            rows = rows.filter(status=chosen)
+        paginator = EnquiryPagination()
+        page = paginator.paginate_queryset(rows, request, view=self)
+        return paginator.get_paginated_response(EnquirySerializer(page, many=True).data)
+
+
+class AdminEnquirySummaryView(APIView):
+    permission_classes = [HasAdminKey]
+
+    def get(self, request):
+        counts = {key: 0 for key, _label in Enquiry.STATUS_CHOICES}
+        grouped = Enquiry.objects.values("status").annotate(total=Count("id"))
+        for row in grouped:
+            if row["status"] in counts:
+                counts[row["status"]] = row["total"]
+        return Response(counts)
 
 
 class AdminEnquiryDetailView(APIView):
@@ -400,13 +582,14 @@ class AdminEnquiryDetailView(APIView):
 
     def patch(self, request, pk):
         row = get_object_or_404(Enquiry, pk=pk)
-        if "read" not in request.data or not isinstance(request.data.get("read"), bool):
+        new_status = request.data.get("status") if hasattr(request.data, "get") else None
+        if new_status not in dict(Enquiry.STATUS_CHOICES):
             return Response(
-                {"error": "read must be a boolean"},
+                {"error": "status must be new, replied, or archived"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        row.read = request.data["read"]
-        row.save(update_fields=["read"])
+        row.status = new_status
+        row.save(update_fields=["status"])
         return Response(EnquirySerializer(row).data)
 
     def delete(self, request, pk):

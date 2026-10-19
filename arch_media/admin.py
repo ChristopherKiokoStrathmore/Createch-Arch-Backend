@@ -29,8 +29,8 @@ class SiteChromeAdmin(admin.ModelAdmin):
 
 @admin.register(Enquiry)
 class EnquiryAdmin(admin.ModelAdmin):
-    list_display = ("created_at", "name", "email", "project_type", "site", "read")
-    list_filter = ("read", "project_type", "stage")
+    list_display = ("created_at", "name", "email", "project_type", "site", "status")
+    list_filter = ("status", "project_type", "stage")
     search_fields = ("name", "email", "site", "message")
     readonly_fields = ("created_at",)
 
