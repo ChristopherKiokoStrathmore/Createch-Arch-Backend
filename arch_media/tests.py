@@ -1130,6 +1130,51 @@ class ApiTests(TestCase):
         row.refresh_from_db()
         self.assertTrue(row.active)
 
+    def test_category_object_id_must_be_a_positive_integer(self):
+        created = self.c.post(
+            "/api/admin/projects/",
+            {
+                "slug": "id-check",
+                "title": "Id check",
+                "publish": True,
+                "discipline": "architecture",
+            },
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(created.status_code, 201, created.content)
+        bad_ids = (
+            ("discipline", True),
+            ("discipline", 1.5),
+            ("discipline", "commercial"),
+            ("segment", True),
+            ("segment", 1.5),
+            ("segment", "architecture"),
+        )
+        for field, raw_id in bad_ids:
+            rejected = self.c.patch(
+                "/api/admin/projects/id-check/",
+                {field: {"id": raw_id}},
+                format="json",
+                **self.auth,
+            )
+            self.assertEqual(rejected.status_code, 400, rejected.content)
+            self.assertIn(f"unknown {field}", str(rejected.json()[field]))
+        project = Project.objects.get(slug="id-check")
+        self.assertEqual(project.discipline.slug, "architecture")
+        self.assertIsNone(project.segment_id)
+
+        commercial = Category.objects.get(slug="commercial")
+        accepted = self.c.patch(
+            "/api/admin/projects/id-check/",
+            {"segment": {"id": str(commercial.pk)}},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.content)
+        self.assertEqual(accepted.json()["segment"]["slug"], "commercial")
+        self.assertEqual(accepted.json()["discipline"]["slug"], "architecture")
+
     def test_categories_are_data_and_existing_project_fields_remain(self):
         public = self.c.get("/api/categories/")
         self.assertEqual(public.status_code, 200, public.content)

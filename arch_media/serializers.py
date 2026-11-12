@@ -58,6 +58,21 @@ class CategorySerializer(serializers.ModelSerializer):
         read_only_fields = ["id"]
 
 
+def positive_category_id(value):
+    """A real integer id greater than 0. Bools, floats, and other strings are not ids."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text.isdigit():
+            return None
+        number = int(text)
+        return number if number > 0 else None
+    return None
+
+
 class CategoryLinkField(serializers.Field):
     """Read a category as an object. Write an id, a slug, that object, or null."""
 
@@ -77,18 +92,23 @@ class CategoryLinkField(serializers.Field):
             return None
         queryset = Category.objects.filter(kind=self.kind)
         if isinstance(data, bool) or isinstance(data, int):
-            if isinstance(data, bool) or data < 1:
+            pk = positive_category_id(data)
+            if pk is None:
                 raise serializers.ValidationError(f"unknown {self.kind}")
-            category = queryset.filter(pk=data).first()
+            category = queryset.filter(pk=pk).first()
         elif isinstance(data, str):
             text = data.strip()
-            if text.isdigit():
-                category = queryset.filter(pk=int(text)).first() or queryset.filter(slug=text).first()
+            pk = positive_category_id(text)
+            if pk is not None:
+                category = queryset.filter(pk=pk).first() or queryset.filter(slug=text).first()
             else:
                 category = queryset.filter(slug=text).first()
         elif isinstance(data, dict):
             if data.get("id") is not None:
-                category = queryset.filter(pk=data.get("id")).first()
+                pk = positive_category_id(data.get("id"))
+                if pk is None:
+                    raise serializers.ValidationError(f"unknown {self.kind}")
+                category = queryset.filter(pk=pk).first()
             elif data.get("slug"):
                 category = queryset.filter(slug=data.get("slug")).first()
             else:
