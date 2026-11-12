@@ -1,7 +1,17 @@
+from django.utils.text import slugify
 from rest_framework import serializers
 
 from .images import normalize_uploaded_image
-from .models import ChromeVersion, Enquiry, MediaAsset, Project, ProjectImage, SiteChrome
+from .models import (
+    Category,
+    ChromeVersion,
+    Enquiry,
+    EnquiryRecipient,
+    MediaAsset,
+    Project,
+    ProjectImage,
+    SiteChrome,
+)
 
 
 class MediaAssetSerializer(serializers.ModelSerializer):
@@ -41,6 +51,87 @@ class ProjectImageSerializer(serializers.ModelSerializer):
         fields = ["id", "asset", "asset_id", "sort"]
 
 
+class CategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Category
+        fields = ["id", "name", "slug", "kind", "order", "active"]
+        read_only_fields = ["id"]
+
+
+def positive_category_id(value):
+    """A real integer id greater than 0. Bools, floats, and other strings are not ids."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text.isdigit():
+            return None
+        number = int(text)
+        return number if number > 0 else None
+    return None
+
+
+class CategoryLinkField(serializers.Field):
+    """Read a category as an object. Write an id, a slug, that object, or null."""
+
+    def __init__(self, kind, **kwargs):
+        self.kind = kind
+        kwargs.setdefault("required", False)
+        kwargs.setdefault("allow_null", True)
+        super().__init__(**kwargs)
+
+    def to_representation(self, value):
+        if value is None:
+            return None
+        return {"id": value.id, "name": value.name, "slug": value.slug, "kind": value.kind}
+
+    def to_internal_value(self, data):
+        if data is None or data == "":
+            return None
+        queryset = Category.objects.filter(kind=self.kind)
+        if isinstance(data, bool) or isinstance(data, int):
+            pk = positive_category_id(data)
+            if pk is None:
+                raise serializers.ValidationError(f"unknown {self.kind}")
+            category = queryset.filter(pk=pk).first()
+        elif isinstance(data, str):
+            text = data.strip()
+            pk = positive_category_id(text)
+            if pk is not None:
+                category = queryset.filter(pk=pk).first() or queryset.filter(slug=text).first()
+            else:
+                category = queryset.filter(slug=text).first()
+        elif isinstance(data, dict):
+            if data.get("id") is not None:
+                pk = positive_category_id(data.get("id"))
+                if pk is None:
+                    raise serializers.ValidationError(f"unknown {self.kind}")
+                category = queryset.filter(pk=pk).first()
+            elif data.get("slug"):
+                category = queryset.filter(slug=data.get("slug")).first()
+            else:
+                category = None
+        else:
+            raise serializers.ValidationError("must be an id, a slug, or null")
+        if category is None:
+            raise serializers.ValidationError(f"unknown {self.kind}")
+        return category
+
+
+def coerce_bool(value, field):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str) and value.strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    if isinstance(value, str) and value.strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    raise serializers.ValidationError({field: "must be a boolean"})
+
+
 class ProjectSerializer(serializers.ModelSerializer):
     cover = MediaAssetSerializer(read_only=True)
     cover_id = serializers.PrimaryKeyRelatedField(
@@ -51,14 +142,46 @@ class ProjectSerializer(serializers.ModelSerializer):
         allow_null=True,
     )
     gallery = ProjectImageSerializer(many=True, read_only=True)
+    discipline = CategoryLinkField(kind="discipline")
+    segment = CategoryLinkField(kind="segment")
 
     class Meta:
         model = Project
         fields = [
-            "id", "slug", "title", "location", "year", "typology", "brief",
+            "id", "slug", "title", "location", "year", "typology",
+            "under_createch", "discipline", "segment", "brief",
             "status", "publish", "order", "cover", "cover_id", "gallery",
             "created_at", "updated_at",
         ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        initial = self.initial_data if isinstance(self.initial_data, dict) else {}
+        if "under_createch" not in initial and "underCreatech" in initial:
+            attrs["under_createch"] = coerce_bool(initial.get("underCreatech"), "under_createch")
+        if "discipline" not in initial and "discipline_id" in initial:
+            attrs["discipline"] = self.fields["discipline"].run_validation(initial.get("discipline_id"))
+        if "segment" not in initial and "segment_id" in initial:
+            attrs["segment"] = self.fields["segment"].run_validation(initial.get("segment_id"))
+        return attrs
+
+
+def unique_category_slug(name, slug, instance=None):
+    text = slugify((slug or "").strip()) or slugify(name or "")
+    if not text:
+        raise serializers.ValidationError({"slug": "slug is required"})
+    taken = Category.objects.filter(slug=text)
+    if instance is not None:
+        taken = taken.exclude(pk=instance.pk)
+    if taken.exists():
+        raise serializers.ValidationError({"slug": "slug already exists"})
+    return text
+
+
+class EnquiryRecipientSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EnquiryRecipient
+        fields = ["id", "email", "active", "created_at", "updated_at"]
         read_only_fields = ["id", "created_at", "updated_at"]
 
 

@@ -13,9 +13,12 @@ It is a standalone Railway service. It does not touch any other backend.
 
 Public (no auth):
 - `GET  /api/health/`             `{ok: true}` or 503. Checks the database, and `createch_cache` on Postgres
-- `GET  /api/projects/`            list published projects
+- `GET  /api/projects/`            list published projects. Optional `status`, `discipline`, `segment`, `under_createch` (alias `underCreatech`)
 - `GET  /api/projects/<slug>/`    one published project
-- `GET  /api/chrome/`             site chrome JSON, without `draft` or `versions`
+- `GET  /api/categories/`         active disciplines and segments. Optional `kind=discipline|segment`
+- `GET  /api/categories/<id>/`    one active category
+- `GET  /api/chrome/`             site chrome JSON, without `draft` or `versions`. `contact.instagram` follows the settings URL
+- `GET  /api/settings/`           `{"instagram": null}` or `{"instagram": "https://..."}`. Null means the site renders no link
 - `POST /api/enquiries/`          public enquiry (honeypot `company`, rate limited). Stored with `status: "new"`
 
 Admin (send header `X-Admin-Key: <ARCH_ADMIN_SECRET>`):
@@ -32,6 +35,13 @@ Admin (send header `X-Admin-Key: <ARCH_ADMIN_SECRET>`):
 - `GET              /api/admin/enquiries/?status=`      paginated inbox, newest first. `status` is `new`, `replied`, or `archived`
 - `GET              /api/admin/enquiries/summary/`      `{"new": 0, "replied": 0, "archived": 0}`
 - `GET/PATCH/DELETE /api/admin/enquiries/<id>/`         read one / set `{"status": "replied"}` / delete
+- `GET/POST         /api/admin/enquiry-recipients/`     list / add `{"email", "active?"}`. Submissions go to every active address
+- `GET/PATCH/DELETE /api/admin/enquiry-recipients/<id>/`  read / change `email` or `active` / remove
+- `GET/PUT/PATCH    /api/admin/settings/`               read / set or clear `{"instagram": "https://..." | "" | null}`
+- `GET/POST         /api/admin/categories/`             list / add `{"name", "kind": "discipline"|"segment", "slug?", "order?", "active?"}`
+- `GET/PATCH/DELETE /api/admin/categories/<id>/`        read / edit / remove. Removing a category leaves the project in place
+
+A project still has its free-text `typology`. It also has `under_createch` (Createch Architects vs Earlier Work; write alias `underCreatech`), `discipline`, and `segment`. `discipline` and `segment` are null until set. Write either as a slug, an id, `{id}` / `{slug}`, or null. `discipline_id` and `segment_id` are accepted when the nested field is omitted. The same fields are returned on the public project endpoints. Old clients can ignore them.
 
 ## Deploy to Railway (once)
 
@@ -80,8 +90,12 @@ Optional size caps (defaults are fine):
     ENQUIRY_MAX_BODY_BYTES        32768
     CHROME_MAX_BODY_BYTES         524288
 
-Email alerts are optional. If any of these are unset, enquiries are still
-saved and the process logs a warning instead of failing the request:
+Email alerts are optional. If the SMTP settings are unset, enquiries are still
+saved and the process logs a warning instead of failing the request.
+Submissions are sent to every active row from
+`/api/admin/enquiry-recipients/`. The migration starts that list with
+`anvi@createch.co.ke`. `ENQUIRY_NOTIFY_TO` is used only when no recipient
+is active:
 
     EMAIL_HOST
     EMAIL_PORT
@@ -89,7 +103,7 @@ saved and the process logs a warning instead of failing the request:
     EMAIL_HOST_PASSWORD
     EMAIL_USE_TLS          true or false
     DEFAULT_FROM_EMAIL
-    ENQUIRY_NOTIFY_TO      comma-separated recipients
+    ENQUIRY_NOTIFY_TO      comma-separated fallback, used only when no recipient is active
 
 `ARCH_ADMIN_SECRET` must be byte-identical to the value you set on Vercel,
 because the Next PIN admin sends it as the `X-Admin-Key` header.
