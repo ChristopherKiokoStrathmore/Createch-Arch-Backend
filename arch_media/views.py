@@ -1,6 +1,7 @@
 import logging
 import os
 from datetime import timedelta
+from urllib.parse import urlparse
 
 from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
@@ -8,27 +9,43 @@ from django.core.cache import cache
 from django.core.exceptions import RequestDataTooBig, ValidationError
 from django.core.mail import get_connection, send_mail
 from django.core.validators import validate_email
-from django.db import connection
+from django.db import connection, transaction
 from django.db.models import Count
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import ParseError
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.views import APIView
 
-from .models import AdminPin, ChromeVersion, Enquiry, MediaAsset, Project, ProjectImage, SiteChrome
+from .models import (
+    AdminPin,
+    Category,
+    ChromeVersion,
+    Enquiry,
+    EnquiryRecipient,
+    MediaAsset,
+    Project,
+    ProjectImage,
+    SiteChrome,
+    SiteSettings,
+)
 from .permissions import HasAdminKey, admin_key_matches
 from .serializers import (
+    CategorySerializer,
     ChromeVersionSerializer,
+    EnquiryRecipientSerializer,
     EnquirySerializer,
     MediaAssetSerializer,
     MediaUploadSerializer,
     ProjectImageSerializer,
     ProjectSerializer,
     SiteChromeSerializer,
+    unique_category_slug,
 )
 
 CHROME_KEY = "default"
@@ -41,6 +58,8 @@ ENQUIRY_ALIASES = {
     "site": "location",
 }
 CACHE_TABLE = "createch_cache"
+SETTINGS_KEY = "default"
+INSTAGRAM_BUCKETS = ("contact", "socials")
 
 
 def reorder_pairs(data, identity_key):
@@ -117,6 +136,127 @@ def service_health():
     return True, ""
 
 
+def _ownership_param(request):
+    """Createch vs Earlier Work. `under_createch` wins when both names are sent."""
+    if "under_createch" in request.query_params:
+        raw = request.query_params.get("under_createch")
+    elif "underCreatech" in request.query_params:
+        raw = request.query_params.get("underCreatech")
+    else:
+        return None
+    lowered = (raw or "").strip().lower()
+    if lowered in {"1", "true", "yes"}:
+        return True
+    if lowered in {"0", "false", "no"}:
+        return False
+    raise ParseError("under_createch must be true or false")
+
+
+def clean_instagram(value):
+    """'' clears the link. None means the value cannot be stored."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return ""
+    if len(text) > 300 or any(ch.isspace() for ch in text):
+        return None
+    parsed = urlparse(text)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return text
+
+
+def current_instagram_url():
+    row = SiteSettings.objects.filter(key=SETTINGS_KEY).first()
+    if row is None:
+        return ""
+    return (row.instagram_url or "").strip()
+
+
+def overlay_instagram(data):
+    """Show the settings URL on chrome contact/socials. Documents without those objects stay put."""
+    if not isinstance(data, dict):
+        return data
+    if not any(isinstance(data.get(bucket), dict) for bucket in INSTAGRAM_BUCKETS):
+        return data
+    url = current_instagram_url()
+    data = dict(data)
+    for bucket in INSTAGRAM_BUCKETS:
+        block = data.get(bucket)
+        if isinstance(block, dict):
+            block = dict(block)
+            block["instagram"] = url
+            data[bucket] = block
+    return data
+
+
+def instagram_from_chrome(data):
+    """The contact or socials instagram value, or None when the document does not carry one."""
+    if not isinstance(data, dict):
+        return None
+    for bucket in INSTAGRAM_BUCKETS:
+        block = data.get(bucket)
+        if isinstance(block, dict) and "instagram" in block:
+            return block.get("instagram")
+    return None
+
+
+def sync_settings_from_chrome(data):
+    raw = instagram_from_chrome(data)
+    if raw is None:
+        return
+    cleaned = clean_instagram(raw)
+    if cleaned is None:
+        return
+    row, _ = SiteSettings.objects.get_or_create(key=SETTINGS_KEY, defaults={"instagram_url": cleaned})
+    if row.instagram_url != cleaned:
+        row.instagram_url = cleaned
+        row.save(update_fields=["instagram_url", "updated_at"])
+
+
+def mirror_instagram_to_chrome(url):
+    """Copy a saved Instagram URL into the chrome document the current site already reads."""
+    chrome = SiteChrome.objects.filter(key=CHROME_KEY).first()
+    if chrome is None or not isinstance(chrome.data, dict):
+        return
+    data = dict(chrome.data)
+    changed = False
+    for bucket in INSTAGRAM_BUCKETS:
+        block = data.get(bucket)
+        if isinstance(block, dict) and block.get("instagram") != url:
+            block = dict(block)
+            block["instagram"] = url
+            data[bucket] = block
+            changed = True
+    if not changed:
+        return
+    archive_published(chrome)
+    chrome.data = data
+    chrome.save()
+
+
+def chrome_response(chrome, public=False):
+    payload = dict(SiteChromeSerializer(chrome).data)
+    data = payload.get("data")
+    if isinstance(data, dict):
+        data = dict(data)
+        if public:
+            for key in PUBLIC_CHROME_OMIT:
+                data.pop(key, None)
+        payload["data"] = overlay_instagram(data)
+    return payload
+
+
+def settings_payload(row):
+    url = (row.instagram_url or "").strip()
+    return {"instagram": url or None, "updated_at": row.updated_at}
+
+
 # ---------------------------------------------------------------- public reads
 
 class PublicProjectViewSet(viewsets.ReadOnlyModelViewSet):
@@ -124,23 +264,51 @@ class PublicProjectViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_field = "slug"
 
     def get_queryset(self):
-        qs = Project.objects.filter(publish=True)
+        qs = Project.objects.filter(publish=True).select_related("discipline", "segment", "cover")
         status_param = self.request.query_params.get("status")
         if status_param in {"ongoing", "completed"}:
             qs = qs.filter(status=status_param)
+        discipline = (self.request.query_params.get("discipline") or "").strip()
+        if discipline:
+            qs = qs.filter(discipline__slug=discipline, discipline__kind="discipline")
+        segment = (self.request.query_params.get("segment") or "").strip()
+        if segment:
+            qs = qs.filter(segment__slug=segment, segment__kind="segment")
+        flag = _ownership_param(self.request)
+        if flag is not None:
+            qs = qs.filter(under_createch=flag)
         return qs
 
 
 class PublicChromeView(APIView):
     def get(self, request):
         chrome, _ = SiteChrome.objects.get_or_create(key=CHROME_KEY)
-        payload = dict(SiteChromeSerializer(chrome).data)
-        if isinstance(payload.get("data"), dict):
-            data = dict(payload["data"])
-            for key in PUBLIC_CHROME_OMIT:
-                data.pop(key, None)
-            payload["data"] = data
-        return Response(payload)
+        return Response(chrome_response(chrome, public=True))
+
+
+class PublicSettingsView(APIView):
+    """GET /api/settings/ — public. instagram is null when the studio has not set a URL."""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request):
+        return Response({"instagram": current_instagram_url() or None})
+
+
+class PublicCategoryViewSet(viewsets.ReadOnlyModelViewSet):
+    """Active disciplines and segments. kind is discipline or segment."""
+
+    serializer_class = CategorySerializer
+
+    def get_queryset(self):
+        kind = (self.request.query_params.get("kind") or "").strip()
+        if kind and kind not in dict(Category.KIND_CHOICES):
+            raise ParseError("kind must be discipline or segment")
+        qs = Category.objects.filter(active=True)
+        if kind:
+            qs = qs.filter(kind=kind)
+        return qs
 
 
 class HealthView(APIView):
@@ -179,7 +347,7 @@ class MediaAssetViewSet(viewsets.ModelViewSet):
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
-    queryset = Project.objects.all()
+    queryset = Project.objects.select_related("discipline", "segment", "cover")
     serializer_class = ProjectSerializer
     permission_classes = [HasAdminKey]
     lookup_field = "slug"
@@ -232,7 +400,7 @@ class AdminChromeView(APIView):
 
     def get(self, request):
         chrome, _ = SiteChrome.objects.get_or_create(key=CHROME_KEY)
-        return Response(SiteChromeSerializer(chrome).data)
+        return Response(chrome_response(chrome))
 
     def put(self, request):
         if body_too_large(request, settings.CHROME_MAX_BODY_BYTES):
@@ -241,7 +409,8 @@ class AdminChromeView(APIView):
         archive_published(chrome)
         chrome.data = request.data.get("data", request.data) if hasattr(request.data, "get") else request.data
         chrome.save()
-        return Response(SiteChromeSerializer(chrome).data)
+        sync_settings_from_chrome(chrome.data)
+        return Response(chrome_response(chrome))
 
 
 class ChromeVersionListView(APIView):
@@ -268,7 +437,8 @@ class ChromeVersionRestoreView(APIView):
             restored["draft"] = draft
         chrome.data = restored
         chrome.save()
-        return Response(SiteChromeSerializer(chrome).data)
+        sync_settings_from_chrome(chrome.data)
+        return Response(chrome_response(chrome))
 
 
 def pin_error(pin):
@@ -419,9 +589,14 @@ ADMIN_INBOX_URL = "https://createch.co.ke/admin"
 
 
 def _mail_config():
-    """SMTP settings taken only from the environment. Incomplete config means no send."""
+    """SMTP settings from the environment. Recipients are the active admin list.
+
+    ENQUIRY_NOTIFY_TO is used only when that list has nobody active, so a cleared
+    list can still fall back to the previous destination. Incomplete SMTP means no send.
+    """
     values = {name: (os.environ.get(name) or "").strip() for name in MAIL_ENV_VARS}
-    if not all(values.values()):
+    smtp_names = [name for name in MAIL_ENV_VARS if name != "ENQUIRY_NOTIFY_TO"]
+    if not all(values[name] for name in smtp_names):
         return None
     try:
         port = int(values["EMAIL_PORT"])
@@ -429,7 +604,11 @@ def _mail_config():
         return None
     if port <= 0:
         return None
-    recipients = [part.strip() for part in values["ENQUIRY_NOTIFY_TO"].split(",") if part.strip()]
+    recipients = list(
+        EnquiryRecipient.objects.filter(active=True).order_by("id").values_list("email", flat=True)
+    )
+    if not recipients:
+        recipients = [part.strip() for part in values["ENQUIRY_NOTIFY_TO"].split(",") if part.strip()]
     if not recipients:
         return None
     use_tls = values["EMAIL_USE_TLS"].lower() in ("1", "true", "yes", "on")
@@ -594,5 +773,235 @@ class AdminEnquiryDetailView(APIView):
 
     def delete(self, request, pk):
         row = get_object_or_404(Enquiry, pk=pk)
+        row.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ------------------------------------------------------- enquiry recipients
+
+def _recipient_email(value):
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if not text or len(text) > 200:
+        return None
+    try:
+        validate_email(text)
+    except ValidationError:
+        return None
+    return text
+
+
+def _recipient_active(value, default=True):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+class AdminEnquiryRecipientListView(APIView):
+    permission_classes = [HasAdminKey]
+
+    def get(self, request):
+        rows = EnquiryRecipient.objects.all()
+        return Response(EnquiryRecipientSerializer(rows, many=True).data)
+
+    def post(self, request):
+        if not hasattr(request.data, "get"):
+            return Response({"error": "JSON object required"}, status=status.HTTP_400_BAD_REQUEST)
+        email = _recipient_email(request.data.get("email"))
+        if not email:
+            return Response({"error": "email is invalid"}, status=status.HTTP_400_BAD_REQUEST)
+        active = _recipient_active(request.data.get("active", True))
+        if active is None:
+            return Response({"error": "active must be a boolean"}, status=status.HTTP_400_BAD_REQUEST)
+        if EnquiryRecipient.objects.filter(email__iexact=email).exists():
+            return Response({"error": "email already exists"}, status=status.HTTP_400_BAD_REQUEST)
+        row = EnquiryRecipient.objects.create(email=email, active=active)
+        return Response(EnquiryRecipientSerializer(row).data, status=status.HTTP_201_CREATED)
+
+
+class AdminEnquiryRecipientDetailView(APIView):
+    permission_classes = [HasAdminKey]
+
+    def get(self, request, pk):
+        row = get_object_or_404(EnquiryRecipient, pk=pk)
+        return Response(EnquiryRecipientSerializer(row).data)
+
+    def patch(self, request, pk):
+        row = get_object_or_404(EnquiryRecipient, pk=pk)
+        if not hasattr(request.data, "get"):
+            return Response({"error": "JSON object required"}, status=status.HTTP_400_BAD_REQUEST)
+        if "email" in request.data:
+            email = _recipient_email(request.data.get("email"))
+            if not email:
+                return Response({"error": "email is invalid"}, status=status.HTTP_400_BAD_REQUEST)
+            if EnquiryRecipient.objects.filter(email__iexact=email).exclude(pk=row.pk).exists():
+                return Response({"error": "email already exists"}, status=status.HTTP_400_BAD_REQUEST)
+            row.email = email
+        if "active" in request.data:
+            active = _recipient_active(request.data.get("active"), default=None)
+            if active is None:
+                return Response({"error": "active must be a boolean"}, status=status.HTTP_400_BAD_REQUEST)
+            row.active = active
+        if "email" not in request.data and "active" not in request.data:
+            return Response({"error": "email or active is required"}, status=status.HTTP_400_BAD_REQUEST)
+        row.save()
+        return Response(EnquiryRecipientSerializer(row).data)
+
+    def delete(self, request, pk):
+        row = get_object_or_404(EnquiryRecipient, pk=pk)
+        row.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------- site settings
+
+class AdminSettingsView(APIView):
+    """GET/PUT/PATCH /api/admin/settings/ — set or clear the public Instagram URL."""
+
+    permission_classes = [HasAdminKey]
+
+    def get(self, request):
+        row, _ = SiteSettings.objects.get_or_create(key=SETTINGS_KEY, defaults={"instagram_url": ""})
+        return Response(settings_payload(row))
+
+    def put(self, request):
+        return self._save(request)
+
+    def patch(self, request):
+        return self._save(request)
+
+    def _save(self, request):
+        if not hasattr(request.data, "get") or "instagram" not in request.data:
+            return Response({"error": "instagram is required"}, status=status.HTTP_400_BAD_REQUEST)
+        cleaned = clean_instagram(request.data.get("instagram"))
+        if cleaned is None:
+            return Response(
+                {"error": "instagram must be empty or an http(s) URL"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        with transaction.atomic():
+            row, _ = SiteSettings.objects.get_or_create(key=SETTINGS_KEY, defaults={"instagram_url": cleaned})
+            if row.instagram_url != cleaned:
+                row.instagram_url = cleaned
+                row.save(update_fields=["instagram_url", "updated_at"])
+            mirror_instagram_to_chrome(cleaned)
+        row.refresh_from_db()
+        return Response(settings_payload(row))
+
+
+# --------------------------------------------------------- categories
+
+def _category_error(exc):
+    detail = exc.detail
+    if isinstance(detail, dict):
+        for messages in detail.values():
+            if isinstance(messages, (list, tuple)) and messages:
+                return str(messages[0])
+            return str(messages)
+    if isinstance(detail, (list, tuple)) and detail:
+        return str(detail[0])
+    return str(detail)
+
+
+def _category_payload(request, instance=None):
+    if not hasattr(request.data, "get"):
+        return None, Response({"error": "JSON object required"}, status=status.HTTP_400_BAD_REQUEST)
+    data = request.data
+    fields = {}
+    if instance is None or "name" in data:
+        name = data.get("name", instance.name if instance else "")
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80:
+            return None, Response({"error": "name is required"}, status=status.HTTP_400_BAD_REQUEST)
+        fields["name"] = name.strip()
+    if instance is None or "kind" in data:
+        kind = data.get("kind", instance.kind if instance else "")
+        if kind not in dict(Category.KIND_CHOICES):
+            return None, Response(
+                {"error": "kind must be discipline or segment"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        fields["kind"] = kind
+    if instance is None or "slug" in data or "name" in fields:
+        supplied = data.get("slug") if "slug" in data else None
+        if supplied is not None and not isinstance(supplied, str):
+            return None, Response({"error": "slug is invalid"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            fields["slug"] = unique_category_slug(
+                fields.get("name", instance.name if instance else ""),
+                supplied if "slug" in data else (None if instance is None else instance.slug),
+                instance,
+            )
+        except DRFValidationError as exc:
+            return None, Response({"error": _category_error(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    if "order" in data or instance is None:
+        order = data.get("order")
+        if order is None and instance is None:
+            kind = fields.get("kind")
+            order = Category.objects.filter(kind=kind).count()
+        if isinstance(order, bool) or not isinstance(order, int) or order < 0:
+            return None, Response({"error": "order must be a positive integer or zero"}, status=status.HTTP_400_BAD_REQUEST)
+        fields["order"] = order
+    if "active" in data or instance is None:
+        active = data.get("active", True if instance is None else instance.active)
+        if not isinstance(active, bool):
+            return None, Response({"error": "active must be a boolean"}, status=status.HTTP_400_BAD_REQUEST)
+        fields["active"] = active
+    if instance is not None and "kind" in fields and fields["kind"] != instance.kind:
+        in_use = instance.discipline_projects.exists() or instance.segment_projects.exists()
+        if in_use:
+            return None, Response(
+                {"error": "kind cannot change while projects use this category"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+    return fields, None
+
+
+class AdminCategoryListView(APIView):
+    permission_classes = [HasAdminKey]
+
+    def get(self, request):
+        kind = (request.query_params.get("kind") or "").strip()
+        if kind and kind not in dict(Category.KIND_CHOICES):
+            return Response(
+                {"error": "kind must be discipline or segment"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        rows = Category.objects.all()
+        if kind:
+            rows = rows.filter(kind=kind)
+        return Response(CategorySerializer(rows, many=True).data)
+
+    def post(self, request):
+        fields, error = _category_payload(request)
+        if error is not None:
+            return error
+        row = Category.objects.create(**fields)
+        return Response(CategorySerializer(row).data, status=status.HTTP_201_CREATED)
+
+
+class AdminCategoryDetailView(APIView):
+    permission_classes = [HasAdminKey]
+
+    def get(self, request, pk):
+        row = get_object_or_404(Category, pk=pk)
+        return Response(CategorySerializer(row).data)
+
+    def patch(self, request, pk):
+        row = get_object_or_404(Category, pk=pk)
+        fields, error = _category_payload(request, instance=row)
+        if error is not None:
+            return error
+        for key, value in fields.items():
+            setattr(row, key, value)
+        row.save()
+        return Response(CategorySerializer(row).data)
+
+    def delete(self, request, pk):
+        row = get_object_or_404(Category, pk=pk)
         row.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)

@@ -15,7 +15,16 @@ from django.views.static import serve
 from PIL import Image
 from rest_framework.test import APIClient
 
-from arch_media.models import AdminPin, Enquiry, MediaAsset, Project
+from arch_media.content_migrate import add_project_category_slots
+from arch_media.models import (
+    AdminPin,
+    Category,
+    Enquiry,
+    EnquiryRecipient,
+    MediaAsset,
+    Project,
+    SiteChrome,
+)
 from arch_media.views import EMAIL_LIMIT, IP_LIMIT
 from config.settings import (
     INSECURE_SECRET_DEFAULT,
@@ -388,7 +397,7 @@ class ApiTests(TestCase):
         self.assertEqual(Enquiry.objects.filter(email="mail@example.com").count(), 1)
         send.assert_called_once()
         kwargs = send.call_args.kwargs
-        self.assertEqual(kwargs["recipient_list"], ["anvi@createch.co.ke", "studio@createch.co.ke"])
+        self.assertEqual(kwargs["recipient_list"], ["anvi@createch.co.ke"])
         self.assertEqual(kwargs["from_email"], "studio@createch.co.ke")
         self.assertIn("Amina Okello", kwargs["message"])
         self.assertIn("mail@example.com", kwargs["message"])
@@ -857,6 +866,391 @@ class ApiTests(TestCase):
         }
         self.assertEqual(log_missing_production_env(complete, ["gunicorn"]), [])
         self.assertEqual(log_missing_production_env({}, ["manage.py", "test"]), [])
+
+    def test_enquiry_recipients_are_editable_and_replace_the_env_list(self):
+        denied = self.c.get("/api/admin/enquiry-recipients/")
+        self.assertEqual(denied.status_code, 403)
+        listing = self.c.get("/api/admin/enquiry-recipients/", **self.auth)
+        self.assertEqual(listing.status_code, 200, listing.content)
+        self.assertEqual(listing.json()[0]["email"], "anvi@createch.co.ke")
+        self.assertTrue(listing.json()[0]["active"])
+
+        duplicate = self.c.post(
+            "/api/admin/enquiry-recipients/",
+            {"email": "ANVI@createch.co.ke"},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(duplicate.status_code, 400, duplicate.content)
+        invalid = self.c.post(
+            "/api/admin/enquiry-recipients/",
+            {"email": "not-an-email"},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(invalid.status_code, 400, invalid.content)
+
+        created = self.c.post(
+            "/api/admin/enquiry-recipients/",
+            {"email": "Studio@createch.co.ke", "active": True},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(created.status_code, 201, created.content)
+        self.assertEqual(created.json()["email"], "studio@createch.co.ke")
+        studio_id = created.json()["id"]
+
+        mail_env = {
+            "EMAIL_HOST": "smtp.example.com",
+            "EMAIL_PORT": "587",
+            "EMAIL_HOST_USER": "studio@createch.co.ke",
+            "EMAIL_HOST_PASSWORD": "secret-not-logged",
+            "EMAIL_USE_TLS": "true",
+            "DEFAULT_FROM_EMAIL": "studio@createch.co.ke",
+            "ENQUIRY_NOTIFY_TO": "noreply@createch.co.ke",
+        }
+        with patch.dict(os.environ, mail_env, clear=False):
+            with patch("arch_media.views.send_mail") as send:
+                saved = self.c.post("/api/enquiries/", self.enquiry(email="both@example.com"), format="json")
+        self.assertEqual(saved.status_code, 201, saved.content)
+        self.assertEqual(
+            send.call_args.kwargs["recipient_list"],
+            ["anvi@createch.co.ke", "studio@createch.co.ke"],
+        )
+        self.assertNotIn("noreply@createch.co.ke", send.call_args.kwargs["recipient_list"])
+        self.assertNotIn("secret-not-logged", send.call_args.kwargs["message"])
+        self.assertNotIn("recipients", saved.json())
+
+        paused = self.c.patch(
+            f"/api/admin/enquiry-recipients/{studio_id}/",
+            {"active": False},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(paused.status_code, 200, paused.content)
+        self.assertFalse(paused.json()["active"])
+        with patch.dict(os.environ, mail_env, clear=False):
+            with patch("arch_media.views.send_mail") as send:
+                self.c.post("/api/enquiries/", self.enquiry(email="anvi-only@example.com"), format="json")
+        self.assertEqual(send.call_args.kwargs["recipient_list"], ["anvi@createch.co.ke"])
+
+        renamed = self.c.patch(
+            f"/api/admin/enquiry-recipients/{listing.json()[0]['id']}/",
+            {"email": "anvi.shah@createch.co.ke"},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(renamed.status_code, 200, renamed.content)
+        self.assertEqual(renamed.json()["email"], "anvi.shah@createch.co.ke")
+
+        EnquiryRecipient.objects.update(active=False)
+        with patch.dict(os.environ, mail_env, clear=False):
+            with patch("arch_media.views.send_mail") as send:
+                fallback = self.c.post(
+                    "/api/enquiries/",
+                    self.enquiry(email="fallback@example.com"),
+                    format="json",
+                )
+        self.assertEqual(fallback.status_code, 201, fallback.content)
+        self.assertEqual(send.call_args.kwargs["recipient_list"], ["noreply@createch.co.ke"])
+
+        removed = self.c.delete(f"/api/admin/enquiry-recipients/{studio_id}/", **self.auth)
+        self.assertEqual(removed.status_code, 204)
+        self.assertFalse(EnquiryRecipient.objects.filter(pk=studio_id).exists())
+
+    def test_instagram_is_public_only_when_set_and_mirrors_into_chrome(self):
+        self.assertEqual(self.c.get("/api/settings/").json(), {"instagram": None})
+        denied = self.c.put(
+            "/api/admin/settings/",
+            {"instagram": "https://www.instagram.com/createch/"},
+            format="json",
+        )
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(self.c.put("/api/settings/", {"instagram": "https://example.com"}, format="json").status_code, 405)
+
+        seeded = self.c.put(
+            "/api/admin/chrome/",
+            {
+                "data": {
+                    "hero": "A",
+                    "contact": {"email": "anvi@createch.co.ke", "instagram": ""},
+                    "draft": {"note": "keep me"},
+                }
+            },
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(seeded.status_code, 200, seeded.content)
+
+        saved = self.c.put(
+            "/api/admin/settings/",
+            {"instagram": "https://www.instagram.com/createch/"},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(saved.status_code, 200, saved.content)
+        self.assertEqual(saved.json()["instagram"], "https://www.instagram.com/createch/")
+        self.assertIn("updated_at", saved.json())
+        self.assertEqual(
+            self.c.get("/api/settings/").json()["instagram"],
+            "https://www.instagram.com/createch/",
+        )
+        admin = self.c.get("/api/admin/chrome/", **self.auth).json()["data"]
+        self.assertEqual(admin["contact"]["instagram"], "https://www.instagram.com/createch/")
+        self.assertEqual(admin["draft"], {"note": "keep me"})
+        self.assertEqual(admin["hero"], "A")
+        public = self.c.get("/api/chrome/").json()["data"]
+        self.assertEqual(public["contact"]["instagram"], "https://www.instagram.com/createch/")
+        self.assertNotIn("draft", public)
+        self.assertEqual(public["contact"]["email"], "anvi@createch.co.ke")
+
+        cleared = self.c.patch(
+            "/api/admin/settings/",
+            {"instagram": None},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(cleared.status_code, 200, cleared.content)
+        self.assertIsNone(cleared.json()["instagram"])
+        self.assertEqual(self.c.get("/api/chrome/").json()["data"]["contact"]["instagram"], "")
+        self.assertEqual(self.c.get("/api/admin/chrome/", **self.auth).json()["data"]["draft"], {"note": "keep me"})
+
+        rejected = self.c.put(
+            "/api/admin/settings/",
+            {"instagram": "javascript:alert(1)"},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(rejected.status_code, 400, rejected.content)
+        self.assertIsNone(self.c.get("/api/settings/").json()["instagram"])
+
+        from_chrome = self.c.put(
+            "/api/admin/chrome/",
+            {
+                "data": {
+                    "hero": "A",
+                    "contact": {"instagram": "https://instagram.com/from-chrome", "email": "anvi@createch.co.ke"},
+                    "draft": {"note": "keep me"},
+                }
+            },
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(from_chrome.status_code, 200, from_chrome.content)
+        self.assertEqual(self.c.get("/api/settings/").json()["instagram"], "https://instagram.com/from-chrome")
+
+        untouched = self.c.put(
+            "/api/admin/chrome/",
+            {"data": {"hero": "B", "draft": {"note": "keep me"}}},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(untouched.status_code, 200, untouched.content)
+        self.assertEqual(self.c.get("/api/settings/").json()["instagram"], "https://instagram.com/from-chrome")
+        self.assertEqual(untouched.json()["data"], {"hero": "B", "draft": {"note": "keep me"}})
+
+        blank = self.c.put(
+            "/api/admin/chrome/",
+            {"data": {"contact": {"instagram": ""}, "hero": "C"}},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(blank.status_code, 200, blank.content)
+        self.assertIsNone(self.c.get("/api/settings/").json()["instagram"])
+        self.assertEqual(blank.json()["data"]["contact"]["instagram"], "")
+
+    def test_categories_are_data_and_existing_project_fields_remain(self):
+        public = self.c.get("/api/categories/")
+        self.assertEqual(public.status_code, 200, public.content)
+        self.assertEqual(
+            [(row["slug"], row["kind"]) for row in public.json()],
+            [
+                ("architecture", "discipline"),
+                ("interior-design", "discipline"),
+                ("commercial", "segment"),
+                ("residential", "segment"),
+            ],
+        )
+        denied = self.c.post("/api/admin/categories/", {"name": "Landscape", "kind": "discipline"}, format="json")
+        self.assertEqual(denied.status_code, 403)
+
+        created = self.c.post(
+            "/api/admin/projects/",
+            {
+                "slug": "villa-01",
+                "title": "Villa 01",
+                "typology": "hospitality",
+                "status": "completed",
+                "publish": True,
+            },
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(created.status_code, 201, created.content)
+        body = created.json()
+        self.assertEqual(body["typology"], "hospitality")
+        self.assertIsNone(body["discipline"])
+        self.assertIsNone(body["segment"])
+        self.assertIs(body["under_createch"], False)
+        self.assertIn("brief", body)
+        self.assertIn("gallery", body)
+
+        assigned = self.c.patch(
+            "/api/admin/projects/villa-01/",
+            {"discipline": "architecture", "segment": "residential", "underCreatech": True},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(assigned.status_code, 200, assigned.content)
+        self.assertEqual(assigned.json()["discipline"]["slug"], "architecture")
+        self.assertEqual(assigned.json()["segment"]["name"], "Residential")
+        self.assertIs(assigned.json()["under_createch"], True)
+        self.assertEqual(assigned.json()["typology"], "hospitality")
+
+        mismatch = self.c.patch(
+            "/api/admin/projects/villa-01/",
+            {"discipline": "commercial"},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(mismatch.status_code, 400, mismatch.content)
+        self.assertEqual(Project.objects.get(slug="villa-01").discipline.slug, "architecture")
+
+        by_id = self.c.patch(
+            "/api/admin/projects/villa-01/",
+            {"segment_id": Category.objects.get(slug="commercial").pk},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(by_id.status_code, 200, by_id.content)
+        self.assertEqual(by_id.json()["segment"]["slug"], "commercial")
+
+        added = self.c.post(
+            "/api/admin/categories/",
+            {"name": "Landscape", "kind": "discipline"},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(added.status_code, 201, added.content)
+        self.assertEqual(added.json()["slug"], "landscape")
+        self.assertTrue(added.json()["active"])
+        landscape_id = added.json()["id"]
+        self.assertEqual(
+            [row["slug"] for row in self.c.get("/api/categories/?kind=discipline").json()],
+            ["architecture", "interior-design", "landscape"],
+        )
+        hidden = self.c.patch(
+            f"/api/admin/categories/{landscape_id}/",
+            {"active": False},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(hidden.status_code, 200, hidden.content)
+        self.assertNotIn("landscape", [row["slug"] for row in self.c.get("/api/categories/").json()])
+        self.assertIn(
+            "landscape",
+            [row["slug"] for row in self.c.get("/api/admin/categories/?kind=discipline", **self.auth).json()],
+        )
+
+        duplicate = self.c.post(
+            "/api/admin/categories/",
+            {"name": "Architecture", "kind": "discipline"},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(duplicate.status_code, 400, duplicate.content)
+        bad_kind = self.c.post(
+            "/api/admin/categories/",
+            {"name": "Hospitality", "kind": "theme"},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(bad_kind.status_code, 400, bad_kind.content)
+
+        earlier = self.c.post(
+            "/api/admin/projects/",
+            {
+                "slug": "earlier-01",
+                "title": "Earlier 01",
+                "publish": True,
+                "discipline_id": Category.objects.get(slug="interior-design").pk,
+                "segment": "commercial",
+                "under_createch": False,
+            },
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(earlier.status_code, 201, earlier.content)
+        own = self.c.get("/api/projects/?under_createch=true&discipline=architecture").json()
+        self.assertEqual([row["slug"] for row in own], ["villa-01"])
+        interiors = self.c.get("/api/projects/?underCreatech=false&segment=commercial").json()
+        self.assertEqual([row["slug"] for row in interiors], ["earlier-01"])
+        bad_flag = self.c.get("/api/projects/?under_createch=maybe")
+        self.assertEqual(bad_flag.status_code, 400)
+
+        removed = self.c.delete(
+            f"/api/admin/categories/{Category.objects.get(slug='architecture').pk}/",
+            **self.auth,
+        )
+        self.assertEqual(removed.status_code, 204)
+        project = Project.objects.get(slug="villa-01")
+        self.assertIsNone(project.discipline_id)
+        self.assertEqual(project.typology, "hospitality")
+        self.assertTrue(project.under_createch)
+        self.assertEqual(project.title, "Villa 01")
+
+    def test_chrome_project_slots_do_not_drop_existing_fields(self):
+        original = {
+            "contact": {"instagram": "", "email": "anvi@createch.co.ke"},
+            "portfolio": {
+                "projects": [
+                    {
+                        "slug": "networks-padel-village",
+                        "title": "Networks Padel Village & Vamos Restaurant",
+                        "typology": "hospitality",
+                        "underCreatech": True,
+                        "order": 1,
+                    },
+                    {
+                        "slug": "indian-restaurant-mumbai",
+                        "typology": "fnb-interiors",
+                        "underCreatech": False,
+                        "discipline": "interior-design",
+                        "segment": "commercial",
+                    },
+                    "leave-me",
+                ]
+            },
+        }
+        updated, changed = add_project_category_slots(original)
+        self.assertTrue(changed)
+        first = updated["portfolio"]["projects"][0]
+        self.assertEqual(first["typology"], "hospitality")
+        self.assertIs(first["underCreatech"], True)
+        self.assertEqual(first["title"], "Networks Padel Village & Vamos Restaurant")
+        self.assertEqual(first["order"], 1)
+        self.assertIsNone(first["discipline"])
+        self.assertIsNone(first["segment"])
+        second = updated["portfolio"]["projects"][1]
+        self.assertEqual(second["discipline"], "interior-design")
+        self.assertEqual(second["segment"], "commercial")
+        self.assertEqual(second["typology"], "fnb-interiors")
+        self.assertIs(updated["portfolio"]["projects"][2], "leave-me")
+        self.assertNotIn("discipline", original["portfolio"]["projects"][0])
+        again, changed_again = add_project_category_slots(updated)
+        self.assertFalse(changed_again)
+        self.assertIs(again, updated)
+
+        chrome = SiteChrome.objects.create(key="default", data=original)
+        stored, stored_changed = add_project_category_slots(chrome.data)
+        self.assertTrue(stored_changed)
+        chrome.data = stored
+        chrome.save(update_fields=["data"])
+        reloaded = SiteChrome.objects.get(pk=chrome.pk).data["portfolio"]["projects"][0]
+        self.assertEqual(reloaded["slug"], "networks-padel-village")
+        self.assertIs(reloaded["underCreatech"], True)
+        self.assertIsNone(reloaded["discipline"])
+        self.assertIsNone(reloaded["segment"])
 
 
 @override_settings(ARCH_ADMIN_SECRET="generate-a-long-random-string")

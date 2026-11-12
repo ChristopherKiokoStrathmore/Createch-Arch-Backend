@@ -26,6 +26,23 @@ class Project(models.Model):
     location = models.CharField(max_length=200, blank=True)
     year = models.CharField(max_length=20, blank=True)
     typology = models.CharField(max_length=120, blank=True)
+    # Createch Architects vs Earlier Work. Existing rows default to Earlier Work;
+    # the published split already stored on chrome projects is left as it is.
+    under_createch = models.BooleanField(default=False)
+    discipline = models.ForeignKey(
+        "Category",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="discipline_projects",
+    )
+    segment = models.ForeignKey(
+        "Category",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="segment_projects",
+    )
     brief = models.TextField(blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="completed")
     publish = models.BooleanField(default=False)
@@ -104,6 +121,57 @@ class Enquiry(models.Model):
 
     def __str__(self):
         return f"{self.name} <{self.email}>"
+
+
+class Category(models.Model):
+    """An editable project axis value: a discipline or a segment.
+
+    The two axes are fixed. The names on each axis are rows, so the studio can
+    add one later without a code change.
+    """
+
+    KIND_CHOICES = [("discipline", "Discipline"), ("segment", "Segment")]
+
+    name = models.CharField(max_length=80)
+    slug = models.SlugField(max_length=80, unique=True)
+    kind = models.CharField(max_length=20, choices=KIND_CHOICES)
+    order = models.PositiveIntegerField(default=0)
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["kind", "order", "id"]
+        verbose_name_plural = "categories"
+
+    def __str__(self):
+        return self.name
+
+
+class EnquiryRecipient(models.Model):
+    """An address that receives enquiry-form submissions. Inactive rows are kept, not mailed."""
+
+    email = models.EmailField(max_length=200, unique=True)
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["id"]
+
+    def __str__(self):
+        return self.email
+
+
+class SiteSettings(models.Model):
+    """Singleton public settings edited from the admin. Empty instagram_url means no link."""
+
+    key = models.CharField(max_length=50, unique=True, default="default")
+    instagram_url = models.CharField(max_length=300, blank=True, default="")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"SiteSettings<{self.key}>"
 
 
 class AdminPin(models.Model):
