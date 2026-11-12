@@ -1,4 +1,13 @@
+from django.core.exceptions import ValidationError
 from django.db import models
+
+from .instagram import clean_instagram
+
+
+def validate_instagram_url(value):
+    """Reject anything clean_instagram would not store unchanged."""
+    if not isinstance(value, str) or clean_instagram(value) != value:
+        raise ValidationError("instagram must be empty or an http(s) URL")
 
 
 class MediaAsset(models.Model):
@@ -167,8 +176,14 @@ class SiteSettings(models.Model):
     """Singleton public settings edited from the admin. Empty instagram_url means no link."""
 
     key = models.CharField(max_length=50, unique=True, default="default")
-    instagram_url = models.CharField(max_length=300, blank=True, default="")
+    instagram_url = models.CharField(
+        max_length=300, blank=True, default="", validators=[validate_instagram_url]
+    )
     updated_at = models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
 
     def __str__(self):
         return f"SiteSettings<{self.key}>"

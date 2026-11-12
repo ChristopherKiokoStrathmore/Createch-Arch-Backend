@@ -1,7 +1,6 @@
 import logging
 import os
 from datetime import timedelta
-from urllib.parse import urlparse
 
 from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
@@ -22,6 +21,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.views import APIView
 
+from .instagram import clean_instagram
 from .models import (
     AdminPin,
     Category,
@@ -152,30 +152,15 @@ def _ownership_param(request):
     raise ParseError("under_createch must be true or false")
 
 
-def clean_instagram(value):
-    """'' clears the link. None means the value cannot be stored."""
-    if value is None:
-        return ""
-    if isinstance(value, (list, tuple)):
-        value = value[0] if value else ""
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text:
-        return ""
-    if len(text) > 300 or any(ch.isspace() for ch in text):
-        return None
-    parsed = urlparse(text)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return None
-    return text
-
-
 def current_instagram_url():
+    """Public Instagram string. A stored value that fails the rule is not served."""
     row = SiteSettings.objects.filter(key=SETTINGS_KEY).first()
     if row is None:
         return ""
-    return (row.instagram_url or "").strip()
+    cleaned = clean_instagram(row.instagram_url)
+    if cleaned is None:
+        return None
+    return cleaned
 
 
 def overlay_instagram(data):
@@ -253,8 +238,8 @@ def chrome_response(chrome, public=False):
 
 
 def settings_payload(row):
-    url = (row.instagram_url or "").strip()
-    return {"instagram": url or None, "updated_at": row.updated_at}
+    cleaned = clean_instagram(row.instagram_url)
+    return {"instagram": (cleaned or None), "updated_at": row.updated_at}
 
 
 # ---------------------------------------------------------------- public reads
@@ -794,9 +779,8 @@ def _recipient_email(value):
     return text
 
 
-def _recipient_active(value, default=True):
-    if value is None:
-        return default
+def _recipient_active(value):
+    """True or false only. JSON null and any other type are rejected."""
     if isinstance(value, bool):
         return value
     return None
@@ -815,9 +799,12 @@ class AdminEnquiryRecipientListView(APIView):
         email = _recipient_email(request.data.get("email"))
         if not email:
             return Response({"error": "email is invalid"}, status=status.HTTP_400_BAD_REQUEST)
-        active = _recipient_active(request.data.get("active", True))
-        if active is None:
-            return Response({"error": "active must be a boolean"}, status=status.HTTP_400_BAD_REQUEST)
+        if "active" in request.data:
+            active = _recipient_active(request.data.get("active"))
+            if active is None:
+                return Response({"error": "active must be a boolean"}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            active = True
         if EnquiryRecipient.objects.filter(email__iexact=email).exists():
             return Response({"error": "email already exists"}, status=status.HTTP_400_BAD_REQUEST)
         row = EnquiryRecipient.objects.create(email=email, active=active)
@@ -843,7 +830,7 @@ class AdminEnquiryRecipientDetailView(APIView):
                 return Response({"error": "email already exists"}, status=status.HTTP_400_BAD_REQUEST)
             row.email = email
         if "active" in request.data:
-            active = _recipient_active(request.data.get("active"), default=None)
+            active = _recipient_active(request.data.get("active"))
             if active is None:
                 return Response({"error": "active must be a boolean"}, status=status.HTTP_400_BAD_REQUEST)
             row.active = active

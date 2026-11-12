@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from django.contrib.auth.hashers import check_password, make_password
 from django.core.cache import cache
-from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.db import OperationalError
@@ -24,6 +24,7 @@ from arch_media.models import (
     MediaAsset,
     Project,
     SiteChrome,
+    SiteSettings,
 )
 from arch_media.views import EMAIL_LIMIT, IP_LIMIT
 from config.settings import (
@@ -1058,6 +1059,76 @@ class ApiTests(TestCase):
         self.assertEqual(blank.status_code, 200, blank.content)
         self.assertIsNone(self.c.get("/api/settings/").json()["instagram"])
         self.assertEqual(blank.json()["data"]["contact"]["instagram"], "")
+
+    def test_instagram_url_is_rejected_in_django_admin_and_hidden_if_already_stored(self):
+        row = SiteSettings.objects.get(key="default")
+        row.instagram_url = "javascript:alert(1)"
+        with self.assertRaises(ValidationError):
+            row.full_clean()
+        with self.assertRaises(ValidationError):
+            row.save()
+        row.instagram_url = "ftp://files.example.com/photo"
+        with self.assertRaises(ValidationError):
+            row.save()
+        row.instagram_url = ""
+        row.save()
+        row.instagram_url = "https://www.instagram.com/createch/"
+        row.full_clean()
+
+        seeded = self.c.put(
+            "/api/admin/chrome/",
+            {"data": {"contact": {"email": "anvi@createch.co.ke", "instagram": ""}}},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(seeded.status_code, 200, seeded.content)
+        SiteSettings.objects.filter(key="default").update(instagram_url="javascript:alert(1)")
+        public = self.c.get("/api/settings/")
+        self.assertEqual(public.status_code, 200, public.content)
+        self.assertIsNone(public.json()["instagram"])
+        self.assertNotIn("javascript:", public.content.decode())
+        admin = self.c.get("/api/admin/settings/", **self.auth)
+        self.assertIsNone(admin.json()["instagram"])
+        chrome = self.c.get("/api/chrome/").json()["data"]["contact"]
+        self.assertIsNone(chrome["instagram"])
+        self.assertEqual(chrome["email"], "anvi@createch.co.ke")
+        self.assertNotIn(b"javascript:", self.c.get("/api/chrome/").content)
+
+    def test_recipient_active_must_be_a_boolean_when_present(self):
+        missing = self.c.post(
+            "/api/admin/enquiry-recipients/",
+            {"email": "default-active@example.com"},
+            format="json",
+            **self.auth,
+        )
+        self.assertEqual(missing.status_code, 201, missing.content)
+        self.assertTrue(missing.json()["active"])
+
+        for payload in (
+            {"email": "null-active@example.com", "active": None},
+            {"email": "text-active@example.com", "active": "true"},
+            {"email": "num-active@example.com", "active": 1},
+        ):
+            rejected = self.c.post(
+                "/api/admin/enquiry-recipients/",
+                payload,
+                format="json",
+                **self.auth,
+            )
+            self.assertEqual(rejected.status_code, 400, rejected.content)
+            self.assertFalse(EnquiryRecipient.objects.filter(email=payload["email"]).exists())
+
+        row = EnquiryRecipient.objects.get(email="anvi@createch.co.ke")
+        for body in ({"active": None}, {"active": "false"}, {"active": 0}):
+            rejected = self.c.patch(
+                f"/api/admin/enquiry-recipients/{row.pk}/",
+                body,
+                format="json",
+                **self.auth,
+            )
+            self.assertEqual(rejected.status_code, 400, rejected.content)
+        row.refresh_from_db()
+        self.assertTrue(row.active)
 
     def test_categories_are_data_and_existing_project_fields_remain(self):
         public = self.c.get("/api/categories/")
